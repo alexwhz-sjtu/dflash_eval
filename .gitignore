@@ -1,0 +1,16 @@
+# 忽略用户指定的目录
+model_answer/
+utils/
+training_data/
+train_exp/output/
+train/output/
+
+# 现有的通用忽略项（建议保留）
+.vscode
+.DS_Store
+__pycache__
+**/*.pyc
+data*/
+jobs/
+wandb/
+logs/
