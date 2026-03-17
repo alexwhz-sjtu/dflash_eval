@@ -32,6 +32,15 @@ from train.loss import WeightedBlockLoss
 from model.dflash_exp import DFlashDraftModel
 
 
+SAMPLE_SELECTION_DIR = Path("/share/wanghanzhen/SpeculativeDecoding/NIPS26/dflash/train_exp/sample_selection")
+
+
+def _build_online_selection_file(dataset_name: str, total_samples: int) -> str:
+    safe_dataset_name = str(dataset_name).replace("/", "_")
+    SAMPLE_SELECTION_DIR.mkdir(parents=True, exist_ok=True)
+    return str(SAMPLE_SELECTION_DIR / f"{safe_dataset_name}_online_selection_n{int(total_samples)}.json")
+
+
 def set_seed(seed: int):
     """设置随机种子"""
     random.seed(seed)
@@ -118,6 +127,8 @@ class DFlashTrainer:
         max_grad_norm: float = 1.0,
         max_seq_length: int = 4096,
         max_samples: int = None,
+        online_total_samples: int = 400000,
+        online_selection_file: str = None,
         use_torch_compile: bool = False,
         seed: int = 42,
         save_steps: int = 500,
@@ -255,10 +266,20 @@ class DFlashTrainer:
         else:
             print(f"==> 加载在线数据集: {data_file}")
             # 对于在线数据集, 传入 dataset_name
+            effective_online_selection_file = online_selection_file
+            if effective_online_selection_file is None:
+                sample_count = max_samples if max_samples is not None else online_total_samples
+                effective_online_selection_file = _build_online_selection_file(
+                    dataset_name=data_file,
+                    total_samples=sample_count,
+                )
             self.dataset = OnlineDataset(
                 dataset_name=data_file,
                 tokenizer=self.tokenizer,
                 max_samples=max_samples,
+                balanced_total_samples=online_total_samples,
+                seed=seed,
+                selection_file=effective_online_selection_file,
             )
             self.collate_fn = online_collate_fn
 
@@ -513,12 +534,7 @@ class DFlashTrainer:
         anchor_positions_list = []
         for i in range(batch_size):
             valid_len = int(attention_mask[i].sum().item())
-            # prompt 长度可能因 padding 而异？ prompt_input_ids 是 left-padded 还是 right-padded?
-            # tokenizer default padding side depends. assume left padding for generation usually?
-            # But prompt_input_ids comes from online_collate_fn which does right padding (0).
-            # "prompt_attention_mask" handles it.
-            # outputs.sequences usually preserves input layout (left/right padding).
-            # AutoTokenizer usually sets padding side.
+            # 处理padding
             
             # Simple approach: Prompt length is known from batch["prompt_input_ids"] valid length.
             prompt_len = int(batch["prompt_attention_mask"][i].sum().item())
@@ -555,7 +571,7 @@ class DFlashTrainer:
         
         total_valid_blocks = 0
         for i in range(batch_size):
-            valid_len = int(attention_mask[i].sum().item())
+            valid_len = int(attention_mask[i].sum().item())  # attention_mask表示有效长度
             for anchor_pos in anchor_positions[i].tolist():
                 if 0 <= anchor_pos and anchor_pos + self.args.block_size <= valid_len:
                     total_valid_blocks += 1
@@ -570,7 +586,7 @@ class DFlashTrainer:
         num_valid_blocks = 0
         
         for i in range(batch_size):
-            valid_len = attention_mask[i].sum().item()
+            valid_len = attention_mask[i].sum().item()  # attention_mask表示有效长度
             full_target_hidden = target_hidden[i:i+1, :valid_len, :]
 
             for anchor_pos in anchor_positions[i].tolist():
@@ -631,6 +647,8 @@ class DFlashTrainer:
         if batch.get("mode") == "online":
             return self.train_step_online_generation(batch)
 
+        # 后面应该都没用了
+        
         input_ids = batch["input_ids"].to(self.device)  # [batch_size, seq_len]
 
         attention_mask = batch["attention_mask"].to(self.device)
@@ -927,6 +945,10 @@ def main():
                        help="最大序列长度")
     parser.add_argument("--max_samples", type=int, default=None,
                        help="仅使用前N条有效训练样本（默认使用全部）")
+    parser.add_argument("--online_total_samples", type=int, default=80000,
+                       help="在线训练时的目标采样总数（按任务类型均衡随机采样）")
+    parser.add_argument("--online_selection_file", type=str, default=None,
+                       help="在线采样记录文件（默认保存到 train_exp/sample_selection，文件名包含样本数）")
     parser.add_argument("--use_torch_compile", action="store_true",
                        help="启用torch.compile优化草稿模型")
     
@@ -980,6 +1002,8 @@ def main():
             max_grad_norm=args.max_grad_norm,
             max_seq_length=args.max_seq_length,
             max_samples=args.max_samples,
+            online_total_samples=args.online_total_samples,
+            online_selection_file=args.online_selection_file,
             use_torch_compile=args.use_torch_compile,
             seed=args.seed,
             save_steps=args.save_steps,

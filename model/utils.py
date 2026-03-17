@@ -1,13 +1,22 @@
+import json
+import os
+import shutil
+import time
 import torch
 from typing import Optional
 from pathlib import Path
-from datasets import load_dataset, Features, Sequence, Value
+from datasets import load_dataset, load_from_disk, Features, Sequence, Value
 
 
 NEMOTRON_LOCAL_DATA_DIR = Path(
     "/share/wanghanzhen/.cache/huggingface/hub/datasets--nvidia--Nemotron-Post-Training-Dataset-v2/"
     "snapshots/5c89e01dd720ae0f4058445ed49c5fb68a03c76e/data"
 )
+
+DATASET_CACHE_ROOT = Path(
+    "/share/wanghanzhen/SpeculativeDecoding/NIPS26/dflash/train_exp/processed_dataset_cache"
+)
+DATASET_CACHE_VERSION = "v1"
 
 def build_target_layer_ids(num_target_layers: int, num_draft_layers: int):
     if num_draft_layers == 1:
@@ -41,8 +50,65 @@ def sample(logits: torch.Tensor, temperature: float = 0.0) -> torch.Tensor:
     probs = torch.softmax(logits, dim=-1)
     return torch.multinomial(probs, num_samples=1).view(bsz, seq_len)
 
-def load_and_process_dataset(data_name: str):
-    data_key = data_name.lower()
+def _dataset_cache_dir(data_key: str) -> Path:
+    safe_key = str(data_key).replace("/", "_")
+    return DATASET_CACHE_ROOT / f"{safe_key}_{DATASET_CACHE_VERSION}"
+
+
+def _wait_for_ready_file(ready_file: Path, timeout_seconds: int = 7200, poll_seconds: float = 1.0):
+    deadline = time.time() + timeout_seconds
+    while True:
+        if ready_file.exists():
+            return
+        if time.time() >= deadline:
+            raise TimeoutError(f"等待缓存数据准备超时: {ready_file}")
+        time.sleep(max(0.2, poll_seconds))
+
+
+def _write_ready_file(ready_file: Path, data_key: str):
+    payload = {
+        "dataset": data_key,
+        "cache_version": DATASET_CACHE_VERSION,
+        "timestamp": int(time.time()),
+        "pid": os.getpid(),
+    }
+    with open(ready_file, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False)
+
+
+def _load_nemotron_parquet(parquet_files: list[str]):
+    try:
+        return load_dataset("parquet", data_files={"train": parquet_files})["train"]
+    except ValueError as exc:
+        error_msg = str(exc)
+        if "Feature type 'List' not found" not in error_msg:
+            raise
+
+        # 兼容旧版 datasets 对 parquet metadata 中 List 类型的解析限制。
+        # 回退为显式 features 读取，避免从 metadata 反序列化失败。
+        print(
+            "==> 检测到 parquet metadata 的 List 特征与当前 datasets 版本不兼容，"
+            "改用显式 features 回退加载"
+        )
+        fallback_features = Features(
+            {
+                "messages": Sequence(
+                    {
+                        "role": Value("string"),
+                        "content": Value("string"),
+                    }
+                )
+            }
+        )
+        return load_dataset(
+            "parquet",
+            data_files={"train": parquet_files},
+            split="train",
+            features=fallback_features,
+        )
+
+
+def _build_and_process_dataset(data_key: str):
 
     # Math datasets
     if data_key == "gsm8k":
@@ -87,7 +153,7 @@ def load_and_process_dataset(data_name: str):
                 f"No parquet files found under Nemotron directory: {NEMOTRON_LOCAL_DATA_DIR}"
             )
 
-        dataset = load_dataset("parquet", data_files={"train": parquet_files})["train"]
+        dataset = _load_nemotron_parquet(parquet_files)
 
         def format_nemotron_prompt(example):
             messages = example.get("messages") or []
@@ -97,9 +163,21 @@ def load_and_process_dataset(data_name: str):
                 if message.get("role") == "user" and message.get("content")
             ]
             prompt = user_messages[0] if user_messages else ""
-            return {"turns": [prompt]}
+            task_value = (
+                example.get("task_type")
+                or example.get("task")
+                or example.get("category")
+                or example.get("source")
+                or "unknown"
+            )
+            return {"turns": [prompt], "task_type": str(task_value)}
 
-        target_features = Features({"turns": Sequence(Value("large_string"))})
+        target_features = Features(
+            {
+                "turns": Sequence(Value("large_string")),
+                "task_type": Value("string"),
+            }
+        )
         dataset = dataset.map(
             format_nemotron_prompt,
             remove_columns=dataset.column_names,
@@ -154,8 +232,54 @@ def load_and_process_dataset(data_name: str):
         )
 
     else:
-        raise ValueError(f"Unsupported dataset: {data_name}")
+        raise ValueError(f"Unsupported dataset: {data_key}")
     
+    return dataset
+
+
+def load_and_process_dataset(data_name: str):
+    data_key = data_name.lower()
+    rank = int(os.environ.get("RANK", "0"))
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+
+    cache_dir = _dataset_cache_dir(data_key)
+    ready_file = cache_dir / "_READY.json"
+
+    # nemotron 已预处理完成时，直接读本地缓存目录，不再走 parquet split/map。
+    if data_key == "nemotron":
+        if cache_dir.exists() and (ready_file.exists() or (cache_dir / "dataset_info.json").exists()):
+            print(f"==> 直接加载已处理数据集: {cache_dir}")
+            return load_from_disk(str(cache_dir))
+        raise FileNotFoundError(
+            "未找到 nemotron 的已处理数据集缓存目录。"
+            f"期望路径: {cache_dir}. "
+            "请先准备好该目录后再运行。"
+        )
+
+    if cache_dir.exists() and ready_file.exists():
+        print(f"==> 复用处理后数据集缓存: {cache_dir}")
+        return load_from_disk(str(cache_dir))
+
+    if world_size > 1 and rank != 0:
+        print(f"==> [rank {rank}] 等待主进程准备缓存数据集: {cache_dir}")
+        _wait_for_ready_file(ready_file)
+        return load_from_disk(str(cache_dir))
+
+    dataset = _build_and_process_dataset(data_key)
+
+    cache_dir.parent.mkdir(parents=True, exist_ok=True)
+    tmp_cache_dir = cache_dir.parent / f".{cache_dir.name}.tmp.{os.getpid()}"
+    if tmp_cache_dir.exists():
+        shutil.rmtree(tmp_cache_dir)
+
+    dataset.save_to_disk(str(tmp_cache_dir))
+
+    if cache_dir.exists():
+        shutil.rmtree(cache_dir)
+    os.replace(str(tmp_cache_dir), str(cache_dir))
+    _write_ready_file(ready_file, data_key)
+
+    print(f"==> 已保存处理后数据集缓存: {cache_dir}")
     return dataset
 
 def build_hybrid_attention_mask(

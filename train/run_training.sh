@@ -24,7 +24,7 @@ DATASET="${DATASET:-nemotron}"
 # 输出目录
 OUTPUT_DIR="${OUTPUT_DIR:-./train/output/dflash_4layers_${DATASET}}"
 DATA_DIR="${DATA_DIR:-./training_data}"
-DATA_FILE="${DATA_FILE:-${DATA_DIR}/${DATASET}_responses.jsonl}"
+DATA_FILE="${DATA_FILE:-${DATA_DIR}/nemotron_2000}"
 
 # 训练参数
 NUM_DRAFT_LAYERS="${NUM_DRAFT_LAYERS:-}"

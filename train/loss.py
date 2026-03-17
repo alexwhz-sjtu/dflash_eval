@@ -39,13 +39,13 @@ class WeightedBlockLoss(nn.Module):
         
         # 自动设置gamma
         if gamma is None:
-            if block_size == 16:
+            if block_size+1 == 16:
                 gamma = 7.0
-            elif block_size == 10:
+            elif block_size+1 == 10:
                 gamma = 5.0
             else:
                 # 线性插值估算
-                gamma = 5.0 + (block_size - 10) * (7.0 - 5.0) / (16 - 10)
+                gamma = 5.0 + (block_size+1 - 10) * (7.0 - 5.0) / (16 - 10)
         
         self.gamma = gamma
         
@@ -62,7 +62,7 @@ class WeightedBlockLoss(nn.Module):
         self.register_buffer('position_weights', weights)
         
         print(f"==> 初始化加权损失函数")
-        print(f"   - 块大小: {block_size}")
+        print(f"   - 块大小: {block_size+1}")
         print(f"   - gamma: {gamma:.2f}")
         print(f"   - 位置权重: {weights.tolist()}")
     
@@ -86,8 +86,9 @@ class WeightedBlockLoss(nn.Module):
         # 计算每个位置的交叉熵损失（不进行reduction）
         # logits: [batch_size, block_size, vocab_size]
         # labels: [batch_size, block_size]
-        logits_flat = logits.view(-1, vocab_size)  # [batch_size * block_size, vocab_size]
-        labels_flat = labels.view(-1)  # [batch_size * block_size]
+        # logits/labels 可能来自切片（非连续内存），使用 reshape 避免 view 的stride限制
+        logits_flat = logits.reshape(-1, vocab_size)  # [batch_size * block_size, vocab_size]
+        labels_flat = labels.reshape(-1)  # [batch_size * block_size]
         
         # 计算每个位置的loss（使用reduction='none'）
         loss_per_token = F.cross_entropy(
@@ -98,7 +99,7 @@ class WeightedBlockLoss(nn.Module):
         )  # [batch_size * block_size]
         
         # 重塑为 [batch_size, block_size]
-        loss_per_token = loss_per_token.view(batch_size, block_size)
+        loss_per_token = loss_per_token.reshape(batch_size, block_size)
         
         # 应用位置权重
         # position_weights: [block_size]
@@ -174,8 +175,8 @@ class SimpleWeightedLoss(nn.Module):
         batch_size, seq_len, vocab_size = logits.shape
         
         # 计算交叉熵损失（不进行reduction）
-        logits_flat = logits.view(-1, vocab_size)
-        labels_flat = labels.view(-1)
+        logits_flat = logits.reshape(-1, vocab_size)
+        labels_flat = labels.reshape(-1)
         
         loss_per_token = F.cross_entropy(
             logits_flat, 
@@ -183,7 +184,7 @@ class SimpleWeightedLoss(nn.Module):
             reduction='none'
         )
         
-        loss_per_token = loss_per_token.view(batch_size, seq_len)
+        loss_per_token = loss_per_token.reshape(batch_size, seq_len)
         
         # 应用掩码（如果提供）
         if mask is not None:
@@ -195,10 +196,10 @@ class SimpleWeightedLoss(nn.Module):
             
             if num_blocks > 0:
                 # 重塑为 [batch_size, num_blocks, block_size]
-                loss_reshaped = loss_per_token[:, :num_blocks * self.block_size].view(
+                loss_reshaped = loss_per_token[:, :num_blocks * self.block_size].reshape(
                     batch_size, num_blocks, self.block_size
                 )
-                mask_reshaped = mask[:, :num_blocks * self.block_size].view(
+                mask_reshaped = mask[:, :num_blocks * self.block_size].reshape(
                     batch_size, num_blocks, self.block_size
                 )
                 

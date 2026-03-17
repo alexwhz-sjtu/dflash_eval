@@ -24,12 +24,100 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 from transformers.models.qwen3.modeling_qwen3 import Qwen3Config
 
 import sys
-from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from train.data.dataset import SimplifiedDataset, simplified_collate_fn
 from train.loss import WeightedBlockLoss
 from model.dflash_exp import DFlashDraftModel
+
+def _resolve_offline_dataset_inputs(data_file: str, features_dir: str | None) -> dict:
+    """
+    解析离线数据输入。
+
+    支持将 data_file 直接指向离线目录：
+    - 自动定位 *_responses.jsonl
+    - 自动定位 *_features 目录
+    - 尝试读取 nemotron_config.json 中的 feature_format / features_per_file
+    """
+    data_path = Path(data_file)
+    result = {
+        "resolved_from_dir": False,
+        "data_file": data_file,
+        "features_dir": features_dir,
+        "feature_format": None,
+        "features_per_file": 1000,
+        "config_path": None,
+    }
+
+    if not data_path.exists() or not data_path.is_dir():
+        return result
+
+    result["resolved_from_dir"] = True
+    config_obj = {}
+    config_path = data_path / "nemotron_config.json"
+    if config_path.exists():
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                config_obj = json.load(f)
+            result["config_path"] = str(config_path)
+        except Exception:
+            config_obj = {}
+
+    response_candidates = []
+    dataset_name = config_obj.get("dataset_name")
+    if isinstance(dataset_name, str) and dataset_name:
+        response_candidates.append(data_path / f"{dataset_name}_responses.jsonl")
+    response_candidates.append(data_path / "nemotron_responses.jsonl")
+    response_candidates.extend(sorted(data_path.glob("*_responses.jsonl")))
+
+    response_file = next((p for p in response_candidates if p.exists()), None)
+    if response_file is None:
+        raise FileNotFoundError(
+            f"离线目录中未找到 *_responses.jsonl: {data_path}"
+        )
+
+    resolved_features_dir = Path(features_dir).expanduser() if features_dir else None
+    if resolved_features_dir is None:
+        cfg_features_dir = config_obj.get("features_dir")
+        if isinstance(cfg_features_dir, str) and cfg_features_dir:
+            cfg_path = Path(cfg_features_dir)
+            cfg_candidates = [
+                cfg_path,
+                data_path / cfg_path,
+                data_path / cfg_path.name,
+            ]
+            resolved_features_dir = next((p for p in cfg_candidates if p.exists()), None)
+
+    if resolved_features_dir is None:
+        feature_dir_candidates = sorted(
+            p for p in data_path.iterdir()
+            if p.is_dir() and p.name.endswith("_features")
+        )
+        if feature_dir_candidates:
+            resolved_features_dir = feature_dir_candidates[0]
+
+    feature_format = config_obj.get("feature_format")
+    features_per_file = int(config_obj.get("features_per_file", 10000))
+    if features_per_file <= 0:
+        features_per_file = 10000
+
+    if resolved_features_dir is not None:
+        has_chunk_zip = any(resolved_features_dir.glob("chunk_*.zip"))
+        has_chunk_pt = any(resolved_features_dir.glob("chunk_*.pt"))
+        if has_chunk_pt and not has_chunk_zip:
+            feature_format = "chunk_pt"
+        elif has_chunk_zip:
+            feature_format = "chunk_zip"
+
+    result.update(
+        {
+            "data_file": str(response_file),
+            "features_dir": str(resolved_features_dir) if resolved_features_dir is not None else None,
+            "feature_format": feature_format,
+            "features_per_file": features_per_file,
+        }
+    )
+    return result
 
 
 def set_seed(seed: int):
@@ -56,6 +144,7 @@ class DFlashTrainer:
         target_model_path: str,
         data_file: str,
         output_dir: str,
+        continue_training: str = None,
         num_draft_layers: int = None,
         draft_config_path: str = None,
         draft_hidden_size: int = None,
@@ -69,7 +158,7 @@ class DFlashTrainer:
         batch_size: int = 4,
         gradient_accumulation_steps: int = 1,
         max_grad_norm: float = 1.0,
-        max_seq_length: int = 3072,
+        max_seq_length: int = 4096,
         max_samples: int = None,
         use_torch_compile: bool = False,
         seed: int = 42,
@@ -78,6 +167,7 @@ class DFlashTrainer:
         device: str = "cuda",
         features_dir: str = None,
         cache_features: bool = False,
+        mmap_features: bool = True,
         use_wandb: bool = False,
         wandb_project: str = "dflash-training",
         wandb_run_name: str = None,
@@ -137,6 +227,12 @@ class DFlashTrainer:
         )
         self.target_model.to(self.device)
         self.target_model.eval()
+
+        # 始终保留 tokenizer + embedding + lm_head，离线特征训练时可裁剪其余backbone。
+        self.target_embed_tokens = self.target_model.model.embed_tokens
+        self.target_lm_head = self.target_model.lm_head
+        self.target_model_dtype = self.target_lm_head.weight.dtype
+        self.target_backbone_pruned = False
         
         # 冻结目标模型
         for param in self.target_model.parameters():
@@ -162,7 +258,7 @@ class DFlashTrainer:
                 print("==> 使用 torch.compile 优化草稿模型")
             self.draft_model = torch.compile(self.draft_model)
 
-        draft_model_dtype = self.target_model.lm_head.weight.dtype
+        draft_model_dtype = self.target_model_dtype
         self.draft_model.to(device=self.device, dtype=draft_model_dtype)
 
         if self.distributed:
@@ -185,13 +281,40 @@ class DFlashTrainer:
         if self.is_main_process:
             print(f"   提取的目标层(全部): {self.target_layer_ids}")
         
-        # 加载数据集
+        # 加载离线数据集
         if self.is_main_process:
             print(f"==> 加载数据集: {data_file}")
-        
-        # 用户明确不使用离线特征
-        features_dir = None
-        
+
+        offline_resolved = _resolve_offline_dataset_inputs(
+            data_file=data_file,
+            features_dir=features_dir,
+        )
+        data_file = offline_resolved["data_file"]
+        features_dir = offline_resolved["features_dir"]
+        offline_feature_format = offline_resolved["feature_format"]
+        offline_features_per_file = offline_resolved["features_per_file"]
+
+        self.args.data_file = data_file
+        self.args.features_dir = features_dir
+        self.args.feature_format = offline_feature_format
+        self.args.features_per_file = offline_features_per_file
+
+        if self.is_main_process and offline_resolved["resolved_from_dir"]:
+            print(f"   离线目录解析 data_file -> {data_file}")
+            print(f"   离线目录解析 features_dir -> {features_dir}")
+            if offline_resolved["config_path"] is not None:
+                print(f"   使用离线配置: {offline_resolved['config_path']}")
+
+        if not os.path.exists(data_file):
+            raise FileNotFoundError(f"训练数据路径不存在: {data_file}")
+
+        if features_dir is None:
+            raise ValueError(
+                "当前训练仅支持离线特征模式，请传入离线数据目录(含*_features)"
+                "或显式指定 --features_dir"
+            )
+
+        print(f"==> 加载数据集文件: {data_file}")
         self.dataset = SimplifiedDataset(
             data_file=data_file,
             tokenizer=self.tokenizer,
@@ -201,21 +324,33 @@ class DFlashTrainer:
             max_samples=max_samples,
             features_dir=features_dir,
             cache_features=cache_features,
+            mmap_features=mmap_features,
+            feature_format=offline_feature_format,
+            features_per_file=offline_features_per_file,
         )
+        self.collate_fn = simplified_collate_fn
 
-        if features_dir is not None and len(self.dataset) > 0:
-            probe_item = self.dataset[0]
-            if "target_hidden" in probe_item and self.is_main_process:
-                probe_dim = int(probe_item["target_hidden"].shape[-1])
-                expected_dim = int(self._unwrap_draft_model().fc.in_features)
-                print(f"   离线特征维度: {probe_dim} | 草稿模型期望维度: {expected_dim}")
+        if len(self.dataset) == 0:
+            raise ValueError("离线数据集为空，请检查 responses 与过滤条件")
 
-        if self.is_main_process and max_samples is not None:
-            print(f"   仅使用前 {len(self.dataset)} 条训练样本")
+        probe_item = self.dataset[0]
+        if "target_hidden" not in probe_item:
+            raise ValueError("离线训练需要 target_hidden 特征，请检查 features_dir")
+
+        if self.is_main_process:
+            probe_dim = int(probe_item["target_hidden"].shape[-1])
+            expected_dim = int(self._unwrap_draft_model().fc.in_features)
+            print(f"   离线特征维度: {probe_dim} | 草稿模型期望维度: {expected_dim}")
+
+        self._prune_target_backbone_if_possible()
+
+        if self.is_main_process:
+            print(f"   使用训练样本数量: {len(self.dataset)}")
 
         # 保存配置（更新features_dir）
         self.args.features_dir = features_dir
         self.args.cache_features = cache_features
+        self.args.mmap_features = mmap_features
         if self.is_main_process:
             with open(self.output_dir / "training_config.json", "w") as f:
                 json.dump(vars(self.args), f, indent=2)
@@ -235,7 +370,7 @@ class DFlashTrainer:
             batch_size=batch_size,
             shuffle=(sampler is None),
             sampler=sampler,
-            collate_fn=simplified_collate_fn,
+            collate_fn=self.collate_fn,
             num_workers=0,  # 使用主进程加载数据
         )
         
@@ -277,6 +412,10 @@ class DFlashTrainer:
         # 训练状态
         self.global_step = 0
         self.epoch = 0
+        self.start_epoch = 0
+
+        if continue_training:
+            self._resume_from_checkpoint(continue_training)
         
         if self.is_main_process:
             print("==> 训练器初始化完成")
@@ -290,6 +429,96 @@ class DFlashTrainer:
         if isinstance(self.draft_model, DDP):
             return self.draft_model.module
         return self.draft_model
+
+    def _resolve_continue_checkpoint(self, continue_training: str) -> Path:
+        resume_path = Path(continue_training).expanduser()
+        if not resume_path.exists():
+            raise FileNotFoundError(f"continue_training 路径不存在: {resume_path}")
+
+        if resume_path.is_file():
+            if resume_path.name != "trainer_state.pt":
+                raise ValueError(
+                    "continue_training 指向文件时，必须是 trainer_state.pt"
+                )
+            checkpoint_dir = resume_path.parent
+            if not (checkpoint_dir / "draft_model").exists():
+                raise FileNotFoundError(
+                    f"未找到 draft_model 目录: {checkpoint_dir / 'draft_model'}"
+                )
+            return checkpoint_dir
+
+        if (resume_path / "trainer_state.pt").exists() and (resume_path / "draft_model").exists():
+            return resume_path
+
+        checkpoint_dirs = [
+            p
+            for p in resume_path.iterdir()
+            if p.is_dir() and (p / "trainer_state.pt").exists() and (p / "draft_model").exists()
+        ]
+        if not checkpoint_dirs:
+            raise FileNotFoundError(
+                f"在 {resume_path} 下未找到可恢复checkpoint（需包含 trainer_state.pt 和 draft_model/）"
+            )
+
+        def _score(p: Path) -> tuple[int, int, float]:
+            state_path = p / "trainer_state.pt"
+            try:
+                trainer_state = torch.load(state_path, map_location="cpu")
+            except Exception:
+                trainer_state = {}
+            global_step = int(trainer_state.get("global_step", -1))
+            epoch = int(trainer_state.get("epoch", -1))
+            return global_step, epoch, p.stat().st_mtime
+
+        checkpoint_dirs.sort(key=_score)
+        return checkpoint_dirs[-1]
+
+    def _resume_from_checkpoint(self, continue_training: str):
+        checkpoint_dir = self._resolve_continue_checkpoint(continue_training)
+        model_dir = checkpoint_dir / "draft_model"
+        trainer_state_path = checkpoint_dir / "trainer_state.pt"
+
+        if self.is_main_process:
+            print(f"==> 继续训练，加载checkpoint: {checkpoint_dir}")
+
+        restored_model = DFlashDraftModel.from_pretrained(str(model_dir))
+        self._unwrap_draft_model().load_state_dict(restored_model.state_dict(), strict=True)
+        del restored_model
+
+        trainer_state = torch.load(trainer_state_path, map_location="cpu")
+        self.optimizer.load_state_dict(trainer_state["optimizer"])
+        self.scheduler.load_state_dict(trainer_state["scheduler"])
+        self.global_step = int(trainer_state.get("global_step", 0))
+        self.epoch = int(trainer_state.get("epoch", 0))
+
+        if checkpoint_dir.name.startswith("checkpoint-epoch-"):
+            self.start_epoch = self.epoch + 1
+        else:
+            self.start_epoch = self.epoch
+
+        if self.is_main_process:
+            print(
+                f"   恢复完成: global_step={self.global_step}, "
+                f"saved_epoch={self.epoch}, resume_epoch={self.start_epoch}"
+            )
+
+    def _prune_target_backbone_if_possible(self):
+        """离线特征训练时仅保留 embedding/lm_head，释放 target backbone 显存。"""
+        if self.target_backbone_pruned:
+            return
+
+        if hasattr(self.target_model, "model") and hasattr(self.target_model.model, "layers"):
+            if self.device.type == "cuda":
+                for layer in self.target_model.model.layers:
+                    layer.to("cpu")
+            self.target_model.model.layers = nn.ModuleList()
+        self.target_backbone_pruned = True
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        if self.is_main_process:
+            print("==> 检测到离线特征，已裁剪 target_model backbone，仅保留 embedding/lm_head/tokenizer")
 
     def _adapt_offline_feature_dim(self, target_hidden: torch.Tensor) -> torch.Tensor:
         """将离线特征维度适配到draft_model.fc的输入维度。"""
@@ -305,6 +534,95 @@ class DFlashTrainer:
             f"离线特征维度不足: got={got_dim}, expected={expected_dim}. "
             "请使用与当前训练配置一致的collect_data特征（全层拼接）。"
         )
+
+    def _build_joint_sparse_attention_mask(
+        self,
+        num_blocks: int,
+        block_size: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """
+        构造联合块训练的稀疏注意力掩码。
+
+        约束：
+        1) 块内双向注意力（query 仅能看同块 noise token）
+        2) query 仅能看本块的 target context token
+        3) 禁止跨块注意力
+
+        返回形状: [1, 1, q_len, kv_len]
+        其中 q_len = num_blocks * block_size, kv_len = num_blocks + q_len
+        """
+        q_len = num_blocks * block_size
+        if q_len == 0:
+            return torch.empty((1, 1, 0, 0), dtype=torch.bool, device=device)
+
+        query_block_ids = torch.arange(q_len, device=device) // block_size
+        target_block_ids = torch.arange(num_blocks, device=device)
+        noise_block_ids = torch.arange(q_len, device=device) // block_size
+        key_block_ids = torch.cat([target_block_ids, noise_block_ids], dim=0)
+
+        mask_2d = query_block_ids.unsqueeze(1).eq(key_block_ids.unsqueeze(0))
+        return mask_2d.unsqueeze(0).unsqueeze(0)
+
+    def _forward_joint_blocks_for_sequence(
+        self,
+        seq_target_hidden_list: list[torch.Tensor],
+        seq_input_ids_list: list[torch.Tensor],
+        seq_labels_list: list[torch.Tensor],
+        seq_position_ids_list: list[torch.Tensor],
+        draft_dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, int]:
+        """
+        对单个序列的多个锚点块进行联合前向（一次前向，稀疏掩码隔离跨块信息）。
+
+        返回：
+        - seq_loss: 标量loss（按该序列有效块做平均）
+        - num_blocks: 该序列有效块数量
+        """
+        num_blocks = len(seq_target_hidden_list)
+        if num_blocks == 0:
+            raise ValueError("_forward_joint_blocks_for_sequence 收到空块列表")
+
+        block_size = self.args.block_size
+
+        # [1, num_blocks, feat_dim]
+        seq_target_hidden = torch.cat(seq_target_hidden_list, dim=1)
+
+        # [num_blocks, block_size]
+        seq_input_ids = torch.stack(seq_input_ids_list, dim=0)
+        seq_labels = torch.stack(seq_labels_list, dim=0)
+        seq_position_ids = torch.stack(seq_position_ids_list, dim=0)
+
+        # [1, num_blocks * block_size, hidden_size]
+        seq_noise_embedding = self.target_embed_tokens(seq_input_ids).to(dtype=draft_dtype)
+        seq_noise_embedding = seq_noise_embedding.reshape(1, num_blocks * block_size, -1)
+
+        # joint position ids: [ctx(num_blocks) + noise(num_blocks * block_size)]
+        ctx_position_ids = seq_position_ids[:, 0]
+        noise_position_ids = seq_position_ids[:, 1:].reshape(-1)
+        joint_position_ids = torch.cat([ctx_position_ids, noise_position_ids], dim=0).unsqueeze(0)
+
+        joint_attention_mask = self._build_joint_sparse_attention_mask(
+            num_blocks=num_blocks,
+            block_size=block_size,
+            device=self.device,
+        )
+
+        draft_hidden_joint = self.draft_model(
+            target_hidden=seq_target_hidden,
+            noise_embedding=seq_noise_embedding,
+            position_ids=joint_position_ids,
+            attention_mask=joint_attention_mask,
+            past_key_values=None,
+            use_cache=False,
+        )
+
+        # [num_blocks, block_size, hidden_size]
+        draft_hidden_blocks = draft_hidden_joint.reshape(num_blocks, block_size, -1)
+        block_logits = self.target_lm_head(draft_hidden_blocks)
+        seq_loss = self.loss_fn(block_logits[:, 1:, :], seq_labels[:, 1:])
+
+        return seq_loss, num_blocks
 
     def _init_wandb(self):
         if not self.is_main_process:
@@ -418,43 +736,16 @@ class DFlashTrainer:
         """
         input_ids = batch["input_ids"].to(self.device)  # [batch_size, seq_len]
         attention_mask = batch["attention_mask"].to(self.device)
-        prompt_lengths = batch["prompt_lengths"].to(self.device)
         anchor_positions = batch["anchor_positions"].to(self.device)
         
         batch_size, seq_len = input_ids.shape
         block_size = self.args.block_size
         
-        # 1. 在线计算目标层隐藏特征 (Online Features)
-        with torch.no_grad():
-            target_outputs = self.target_model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                output_hidden_states=True,
-                use_cache=False,
-            )
+        if "target_hidden" not in batch:
+            raise ValueError("当前训练仅支持离线特征，请检查数据与features_dir")
 
-            # 提取目标模型所有decoder层隐藏状态，并在特征维拼接
-            # hidden_states: [embeddings, layer1, ..., layerN]
-            all_layer_hidden = torch.stack(list(target_outputs.hidden_states[1:]), dim=2)
-            # [batch_size, seq_len, num_layers, hidden_size] -> [batch_size, seq_len, num_layers * hidden_size]
-            target_hidden = all_layer_hidden.reshape(
-                all_layer_hidden.shape[0],
-                all_layer_hidden.shape[1],
-                -1,
-            )
-
-            # 与离线特征语义保持一致：
-            # response位置i保存“生成t_i之前”的hidden，即h_{i-1}
-            aligned_target_hidden = target_hidden.clone()
-            for i in range(batch_size):
-                valid_len = int(attention_mask[i].sum().item())
-                prompt_len = int(prompt_lengths[i].item())
-                if 0 < prompt_len < valid_len:
-                    aligned_target_hidden[i, prompt_len:valid_len, :] = target_hidden[i, prompt_len - 1:valid_len - 1, :]
-            target_hidden = aligned_target_hidden
-
-        # 释放target_outputs以节省显存
-        del target_outputs
+        target_hidden = batch["target_hidden"].to(self.device).to(dtype=self.target_model_dtype)
+        target_hidden = self._adapt_offline_feature_dim(target_hidden)
 
         draft_model = self._unwrap_draft_model()
         draft_dtype = draft_model.fc.weight.dtype
@@ -475,114 +766,83 @@ class DFlashTrainer:
                 "num_samples": 0,
             }
 
-        # 3. 对每个样本的随机锚点进行块训练
-        
-        # 收集Batch内所有有效的训练样本
-        batch_target_hidden_list = []
-        batch_input_ids_list = []
-        batch_labels_list = []
-        batch_position_ids_list = []
-        
+        # 3. 序列内联合块训练：每个序列一次前向（块拼接+稀疏注意力），块间不互相可见
+        total_loss_value = 0.0
+
         for i in range(batch_size):
             valid_len = int(attention_mask[i].sum().item())
-            # [1, seq_len, hidden_size]
             full_target_hidden = target_hidden[i:i+1, :valid_len, :]
+
+            seq_target_hidden_list = []
+            seq_input_ids_list = []
+            seq_labels_list = []
+            seq_position_ids_list = []
 
             for anchor_pos in anchor_positions[i].tolist():
                 if anchor_pos < 0 or anchor_pos + block_size > valid_len:
                     continue
 
-                # 不使用kvcache：取“与锚点token对齐”的target hidden（即预测该token之前的hidden）
-                # [1, 1, hidden_size]
+                # 与锚点token对齐的target hidden（预测该token之前的hidden）
                 anchor_context_hidden = full_target_hidden[:, anchor_pos:anchor_pos + 1, :]
-                batch_target_hidden_list.append(anchor_context_hidden)
+                seq_target_hidden_list.append(anchor_context_hidden)
 
-            # 3. 构造块输入/标签
-                # block_labels: [block_size]
                 block_labels = input_ids[i, anchor_pos:anchor_pos + block_size].clone()
-                batch_labels_list.append(block_labels)
-                
-                # block_input_ids: [block_size]
+                seq_labels_list.append(block_labels)
+
                 block_input_ids = input_ids[i, anchor_pos:anchor_pos + block_size].clone()
                 block_input_ids[1:] = draft_model.mask_token_id
-                batch_input_ids_list.append(block_input_ids)
+                seq_input_ids_list.append(block_input_ids)
 
-                # position_ids: [block_size + 1] (include target hidden pos)
                 block_position_ids = torch.arange(
                     anchor_pos - 1,
                     anchor_pos + block_size,
                     dtype=torch.long,
                     device=self.device,
                 )
-                batch_position_ids_list.append(block_position_ids)
-        
-        num_valid_blocks = len(batch_target_hidden_list)
-        
-        if num_valid_blocks > 0:
-            # 拼接成大Batch
-            # [num_blocks, 1, hidden_size]
-            batch_target_hidden = torch.cat(batch_target_hidden_list, dim=0)
-            
-            # [num_blocks, block_size]
-            batch_input_ids = torch.stack(batch_input_ids_list, dim=0)
-            
-            # [num_blocks, block_size]
-            batch_labels = torch.stack(batch_labels_list, dim=0)
-            
-            # [num_blocks, block_size + 1]
-            batch_position_ids = torch.stack(batch_position_ids_list, dim=0)
-            
-            # 计算Embedding [num_blocks, block_size, hidden_size]
-            batch_noise_embedding = self.target_model.model.embed_tokens(
-                batch_input_ids
-            ).to(dtype=draft_dtype)
-            
-            # 4. 草稿模型前向传播：一次性处理所有锚点
-            draft_hidden = self.draft_model(
-                target_hidden=batch_target_hidden,
-                noise_embedding=batch_noise_embedding,
-                position_ids=batch_position_ids,
-                attention_mask=None,
-                past_key_values=None,
-                use_cache=False,
+                seq_position_ids_list.append(block_position_ids)
+
+            seq_num_blocks = len(seq_target_hidden_list)
+            if seq_num_blocks == 0:
+                continue
+
+            seq_loss, _ = self._forward_joint_blocks_for_sequence(
+                seq_target_hidden_list=seq_target_hidden_list,
+                seq_input_ids_list=seq_input_ids_list,
+                seq_labels_list=seq_labels_list,
+                seq_position_ids_list=seq_position_ids_list,
+                draft_dtype=draft_dtype,
             )
 
-            # [num_blocks, block_size, vocab_size]
-            # 注意: draft_hidden 包含了 target_hidden (token 0) 和 noise_embedding (token 1..block_size)
-            # 输出 logits 应该对应 noise部分的预测
-            block_logits = self.target_model.lm_head(draft_hidden[:, -block_size:, :])
-            
-            # 跳过锚点token（第0个），只计算后续生成的token的损失
-            # loss_fn expects [batch_size, seq_len-1, vocab_size] vs [batch_size, seq_len-1]
-            loss = self.loss_fn(block_logits[:, 1:, :], batch_labels[:, 1:])
-
-            # 反向传播
-            # 归一化: divide by num_valid_blocks (average over batch) and gradient_accumulation_steps
-            # 注意: loss_fn usually returns mean. Wait, weighted loss returns scalar mean?
-            # Let's check loss_fn behavior. It returns scalar mean.
-            # So loss is already averaged over num_blocks.
-            # We just need to divide by gradient_accumulation_steps.
-            normalized_loss = loss / self.args.gradient_accumulation_steps
+            weighted_seq_loss = seq_loss * (seq_num_blocks / float(total_valid_blocks))
+            normalized_loss = weighted_seq_loss / self.args.gradient_accumulation_steps
             normalized_loss.backward()
-            
-            total_loss_value = float(loss.detach().item()) * num_valid_blocks
-        else:
-            total_loss_value = 0.0
+
+            total_loss_value += float(seq_loss.detach().item()) * seq_num_blocks
 
         return {
-            "loss": total_loss_value / max(num_valid_blocks, 1),
-            "num_samples": num_valid_blocks,
+            "loss": total_loss_value / max(total_valid_blocks, 1),
+            "num_samples": total_valid_blocks,
         }
     
     def train(self):
         """训练主循环"""
         if self.is_main_process:
             print("==> 开始训练")
+
+        if self.start_epoch >= self.args.num_epochs:
+            if self.is_main_process:
+                print(
+                    f"==> 恢复epoch({self.start_epoch}) 已达到/超过 num_epochs({self.args.num_epochs})，无需继续训练"
+                )
+            return
+
+        if self.start_epoch > 0 and self.is_main_process:
+            print(f"==> 从 Epoch {self.start_epoch + 1}/{self.args.num_epochs} 继续训练")
         
         self.draft_model.train()
         self.optimizer.zero_grad(set_to_none=True)
         
-        for epoch in range(self.args.num_epochs):
+        for epoch in range(self.start_epoch, self.args.num_epochs):
             self.epoch = epoch
             if isinstance(self.dataloader.sampler, DistributedSampler):
                 self.dataloader.sampler.set_epoch(epoch)
@@ -711,10 +971,12 @@ def main():
     # 模型参数
     parser.add_argument("--target_model_path", type=str, required=True,
                        help="目标模型路径")
-    parser.add_argument("--data_file", type=str, required=True,
-                       help="训练数据文件（jsonl格式）")
+    parser.add_argument("--data_file", type=str, default="nemotron",
+                       help="训练数据文件（jsonl格式）或离线数据目录（自动解析 *_responses.jsonl 与 *_features）")
     parser.add_argument("--output_dir", type=str, required=True,
                        help="输出目录")
+    parser.add_argument("--continue-training", "--continue_training", dest="continue_training", type=str, default=None,
+                       help="继续训练路径，可传输出目录或checkpoint目录（自动恢复最近状态）")
     
     # 草稿模型配置
     parser.add_argument("--num_draft_layers", type=int, default=None,
@@ -765,6 +1027,8 @@ def main():
                        help="离线特征目录（若存在则跳过目标模型前向）")
     parser.add_argument("--cache_features", action="store_true",
                        help="缓存离线特征到内存（减少IO）")
+    parser.add_argument("--disable_mmap_features", action="store_true",
+                       help="关闭 chunk_pt 的 mmap 加载（默认开启）")
     parser.add_argument("--use_wandb", action="store_true",
                        help="启用Weights & Biases训练监控")
     parser.add_argument("--wandb_project", type=str, default="dflash-training",
@@ -787,6 +1051,7 @@ def main():
             target_model_path=args.target_model_path,
             data_file=args.data_file,
             output_dir=args.output_dir,
+            continue_training=args.continue_training,
             num_draft_layers=args.num_draft_layers,
             draft_config_path=args.draft_config_path,
             draft_hidden_size=args.draft_hidden_size,
@@ -809,6 +1074,7 @@ def main():
             device=args.device,
             features_dir=args.features_dir,
             cache_features=args.cache_features,
+            mmap_features=not args.disable_mmap_features,
             use_wandb=args.use_wandb,
             wandb_project=args.wandb_project,
             wandb_run_name=args.wandb_run_name,

@@ -4,6 +4,8 @@ utils/
 training_data/
 train_exp/output/
 train/output/
+train/data/training_data/
+train_exp/processed_dataset_cache
 
 # 现有的通用忽略项（建议保留）
 .vscode

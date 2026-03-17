@@ -67,6 +67,7 @@ class Qwen3DFlashAttention(nn.Module):
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         bsz, q_len = hidden_states.shape[:-1]
+        ctx_len = target_hidden.shape[1]
         
         '''
         q = self.q_proj(hidden_states)
@@ -84,8 +85,9 @@ class Qwen3DFlashAttention(nn.Module):
         q = q.view(bsz, q_len, -1, self.head_dim)
         q = self.q_norm(q).transpose(1, 2)
         
-        k = self.k_proj(hidden_states).view(bsz, q_len, -1, self.head_dim)
-        v = self.v_proj(hidden_states).view(bsz, q_len, -1, self.head_dim)
+        kv_input = torch.cat([target_hidden, hidden_states], dim=1)
+        k = self.k_proj(kv_input).view(bsz, ctx_len + q_len, -1, self.head_dim)
+        v = self.v_proj(kv_input).view(bsz, ctx_len + q_len, -1, self.head_dim)
         
         k = self.k_norm(k).transpose(1, 2)
         v = v.transpose(1, 2)
@@ -191,7 +193,6 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
     ) -> CausalLMOutputWithPast:
         hidden_states = noise_embedding
         target_hidden = self.hidden_norm(self.fc(target_hidden))
-        hidden_states = torch.cat([target_hidden, hidden_states], dim=1)
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
         for layer in self.layers:
             hidden_states = layer(

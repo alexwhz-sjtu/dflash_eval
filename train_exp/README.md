@@ -1,10 +1,11 @@
 ## MTP训练说明
 
-离线收集需占用700TB，因此使用在线收集，即对每个batch样本先用大模型生成一遍response，再训练小模型。
+数据收集可以是两种方式：
 
-生成序列长度为4096，随机选择512个锚点预测后面一块噪声块。
+- 在线收集：边生成边保存 `responses + hidden features`
+- 离线收集：提前准备好目录
 
-在特征维度拼接大模型全部层的隐藏状态
+训练阶段统一使用离线目录输入，不再在训练中做在线生成。
 
 ## 训练草稿模型
 
@@ -12,16 +13,15 @@
 
 ```bash
 cd dflash
-bash train/run_training.sh
+bash train_exp/run_training.sh
 ```
 
 常用环境变量参数：
 
 - `TARGET_MODEL`: 目标模型路径或 Hugging Face 模型 ID。
 - `DRAFT_CONFIG`: 草稿模型配置来源，可为本地 `config.json`、模型目录或 Hugging Face 模型 ID。
-- `DATASET`: 数据集名称，仅用于推导默认 `DATA_FILE` 和特征目录。
-- `DATA_DIR`: 数据目录。
-- `DATA_FILE`: 显式指定训练数据文件路径；若不指定，默认使用 `${DATA_DIR}/${DATASET}_responses.jsonl`。
+- `TRAIN_DATA_DIR`: 离线训练目录（包含 `*_responses.jsonl` 与 `*_features`）。
+- `FEATURES_DIR`: 可选，显式指定特征目录；不指定时自动从 `TRAIN_DATA_DIR` 解析。
 - `OUTPUT_DIR`: 模型输出目录。
 - `NUM_DRAFT_LAYERS`: 可选；若设置，会覆盖 `DRAFT_CONFIG` 中的 `num_hidden_layers`。
 - `BLOCK_SIZE`: speculative block 大小。
@@ -39,33 +39,45 @@ bash train/run_training.sh
 - `WANDB_GROUP`: wandb 分组。
 - `WANDB_TAGS`: wandb 标签，逗号分隔。
 
+离线目录示例：
+
+```text
+/share/wanghanzhen/SpeculativeDecoding/NIPS26/dflash/train/data/training_data/nemotron_2000
+  ├─ nemotron_config.json
+  ├─ nemotron_responses.jsonl
+  └─ nemotron_2000_features/
+     ├─ chunk_00000.pt
+     └─ chunk_00001.pt
+```
+
 示例：
 
-多卡示例：
+多卡离线训练：
 
 ```bash
 cd dflash
-CUDA_VISIBLE_DEVICES=0,1,2,3\
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
 NPROC_PER_NODE=4 \
 MASTER_PORT=29500 \
 TARGET_MODEL=/share/public/public_models/Qwen3-8B \
 DRAFT_CONFIG=./train/model_config.json \
-DATASET=nemotron \
-OUTPUT_DIR=./train_exp/output/dmtp_nemotron \
+TRAIN_DATA_DIR=/share/wanghanzhen/SpeculativeDecoding/NIPS26/dflash/train/data/training_data/nemotron_2000 \
+OUTPUT_DIR=./train_exp/output/dflash_nemotron_2000 \
 BATCH_SIZE=2 \
 bash train_exp/run_training.sh
 ```
 
-等价的 Python 命令：
+等价 Python 命令：
 
 ```bash
 cd dflash
-python train/train.py \
+python train_exp/train_anchor_batch.py \
 	--target_model_path z-lab/Qwen3-8B-DFlash-b16 \
 	--draft_config_path ./train/model_config.json \
-	--data_file ./training_data/nemotron_responses.jsonl \
-	--output_dir ./output/dflash_nemotron \
+	--data_file /share/wanghanzhen/SpeculativeDecoding/NIPS26/dflash/train/data/training_data/nemotron_2000 \
+	--output_dir ./train_exp/output/dflash_nemotron_2000 \
 	--block_size 16 \
+	--anchors_per_sequence 512 \
 	--learning_rate 6e-4 \
 	--weight_decay 0.01 \
 	--warmup_ratio 0.04 \
@@ -74,21 +86,21 @@ python train/train.py \
 	--gradient_accumulation_steps 4 \
 	--max_grad_norm 1.0 \
 	--max_seq_length 4096 \
-	--features_dir ./training_data/nemotron_features \
+	--features_dir /share/wanghanzhen/SpeculativeDecoding/NIPS26/dflash/train/data/training_data/nemotron_2000/nemotron_2000_features \
 	--save_steps 500 \
-	--logging_steps 10 \
+	--logging_steps 100 \
 	--seed 42
 ```
 
 如果需要覆盖草稿层数：
 
 ```bash
-python train/train.py \
+python train_exp/train_anchor_batch.py \
 	--target_model_path z-lab/Qwen3-8B-DFlash-b16 \
 	--draft_config_path ./train/model_config.json \
 	--num_draft_layers 5 \
-	--data_file ./training_data/nemotron_responses.jsonl \
-	--output_dir ./output/dflash_nemotron
+	--data_file /share/wanghanzhen/SpeculativeDecoding/NIPS26/dflash/train/data/training_data/nemotron_2000 \
+	--output_dir ./train_exp/output/dflash_nemotron_2000
 ```
 
 ## 当前默认配置
@@ -118,7 +130,7 @@ python train/train.py \
 ```bash
 cd dflash
 bash train/run_collect_data.sh
-bash train/run_training.sh
+bash train_exp/run_training.sh
 ```
 
-如果已经有现成的 `responses.jsonl` 和 `features` 目录，可以直接跳过数据收集，只运行训练脚本。
+如果已经有现成离线目录（含 `responses + features`），可以直接跳过数据收集，只运行训练脚本。

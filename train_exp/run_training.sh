@@ -8,8 +8,8 @@ set -e  # 遇到错误立即退出
 # ========================================
 
 # GPU 设置
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
-NPROC_PER_NODE="${NPROC_PER_NODE:-4}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5}"
+NPROC_PER_NODE="${NPROC_PER_NODE:-6}"
 MASTER_PORT="${MASTER_PORT:-29500}"
 
 # 目标模型路径
@@ -18,12 +18,10 @@ TARGET_MODEL="${TARGET_MODEL:-/share/public/public_models/Qwen3-8B}"
 # 草稿模型配置来源（可为本地config.json、模型目录或HF模型ID）
 DRAFT_CONFIG="${DRAFT_CONFIG:-./train/model_config.json}"
 
-# 数据集选择
-DATASET="${DATASET:-nemotron}"
-
 # 输出目录
-OUTPUT_DIR="${OUTPUT_DIR:-./train_exp/output/dflash_4layers_${DATASET}}"
-DATA_DIR="${DATA_DIR:-./training_data}"
+TRAIN_DATA_DIR="${TRAIN_DATA_DIR:-/share/wanghanzhen/SpeculativeDecoding/NIPS26/dflash/train/data/training_data/nemotron_2000}"
+OUTPUT_DIR="${OUTPUT_DIR:-./train_exp/output/dflash_nemotron_2000}"
+FEATURES_DIR="${FEATURES_DIR:-}"
 
 # 训练参数
 NUM_DRAFT_LAYERS="${NUM_DRAFT_LAYERS:-}"
@@ -52,9 +50,8 @@ echo "DFlash 训练启动脚本"
 echo "=========================================="
 echo "目标模型: ${TARGET_MODEL}"
 echo "草稿配置: ${DRAFT_CONFIG}"
-echo "数据集: ${DATASET}"
+echo "离线数据目录: ${TRAIN_DATA_DIR}"
 echo "输出目录: ${OUTPUT_DIR}"
-echo "数据目录: ${DATA_DIR}"
 echo "草稿模型层数: ${NUM_DRAFT_LAYERS:-使用草稿配置默认值}"
 echo "每序列锚点数: ${ANCHORS_PER_SEQUENCE}"
 echo "训练样本数: ${MAX_SAMPLES:-全部样本}"
@@ -77,9 +74,13 @@ if [[ "${DRAFT_CONFIG}" == /* || "${DRAFT_CONFIG}" == ./* || "${DRAFT_CONFIG}" =
     exit 1
 fi
 
+if [ ! -d "${TRAIN_DATA_DIR}" ]; then
+    echo "错误：离线数据目录不存在: ${TRAIN_DATA_DIR}"
+    exit 1
+fi
+
 # 创建输出目录
 mkdir -p ${OUTPUT_DIR}
-mkdir -p ${DATA_DIR}
 
 # ========================================
 # 训练草稿模型
@@ -89,13 +90,17 @@ echo "==> 开始训练草稿模型"
 echo "    输出目录: ${OUTPUT_DIR}"
 echo ""
 
-FEATURES_DIR="${DATA_DIR}/${DATASET}_features"
 FEATURES_ARGS=""
-if [ -d "${FEATURES_DIR}" ]; then
-    FEATURES_ARGS="--features_dir ${FEATURES_DIR}"
-    if [ "${CACHE_FEATURES}" = "true" ]; then
-        FEATURES_ARGS="${FEATURES_ARGS} --cache_features"
+if [ -n "${FEATURES_DIR}" ]; then
+    if [ ! -d "${FEATURES_DIR}" ]; then
+        echo "错误：FEATURES_DIR 不是有效目录: ${FEATURES_DIR}"
+        exit 1
     fi
+    FEATURES_ARGS="--features_dir ${FEATURES_DIR}"
+fi
+
+if [ -n "${FEATURES_ARGS}" ] && [ "${CACHE_FEATURES}" = "true" ]; then
+    FEATURES_ARGS="${FEATURES_ARGS} --cache_features"
 fi
 
 if [ "${NPROC_PER_NODE}" -gt 1 ]; then
@@ -129,8 +134,9 @@ if [ -n "${MAX_SAMPLES}" ]; then
     EXTRA_TRAIN_ARGS+=(--max_samples "${MAX_SAMPLES}")
 fi
 
-"${LAUNCHER[@]}" ./train_exp/train.py \
+"${LAUNCHER[@]}" ./train_exp/train_anchor_batch.py \
     --target_model_path ${TARGET_MODEL} \
+    --data_file "${TRAIN_DATA_DIR}" \
     --draft_config_path ${DRAFT_CONFIG} \
     --output_dir ${OUTPUT_DIR} \
     --block_size ${BLOCK_SIZE} \
@@ -145,7 +151,7 @@ fi
     --max_seq_length 4096 \
     ${FEATURES_ARGS} \
     ${WANDB_ARGS} \
-    --save_steps 1000 \
+    --save_steps 500 \
     --logging_steps 100 \
     --seed 42 \
     "${EXTRA_TRAIN_ARGS[@]}"
