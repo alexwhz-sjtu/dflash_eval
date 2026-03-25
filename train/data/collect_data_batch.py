@@ -34,22 +34,56 @@ from model.utils import load_and_process_dataset
 SAMPLE_SELECTION_DIR = Path("/share/wanghanzhen/SpeculativeDecoding/NIPS26/dflash/train_exp/sample_selection")
 
 
-class FeatureChunkPtWriter:
-    def __init__(self, features_dir: Path, rank: int, features_per_file: int):
+class FeatureChunkWriter:
+    def __init__(
+        self,
+        features_dir: Path,
+        rank: int,
+        features_per_file: int,
+        feature_format: str = "chunk_zip",
+        zip_compress_level: int = 6,
+    ):
         self.features_dir = features_dir
         self.rank = rank
         self.features_per_file = features_per_file
+        self.feature_format = feature_format
+        self.zip_compress_level = max(0, min(int(zip_compress_level), 9))
         self.current_chunk_id = None
         self.current_chunk_data = {}
 
-    def _pt_path(self, chunk_id: int) -> Path:
-        return self.features_dir / f"chunk_{chunk_id:05d}.rank{self.rank}.pt"
+    def _chunk_path(self, chunk_id: int) -> Path:
+        if self.feature_format == "chunk_pt":
+            return self.features_dir / f"chunk_{chunk_id:05d}.rank{self.rank}.pt"
+        if self.feature_format == "chunk_zip":
+            return self.features_dir / f"chunk_{chunk_id:05d}.rank{self.rank}.zip"
+        raise ValueError(f"不支持的 feature_format: {self.feature_format}")
+
+    def _flush_current_chunk(self):
+        if self.current_chunk_id is None:
+            return
+        chunk_path = self._chunk_path(self.current_chunk_id)
+        if self.feature_format == "chunk_pt":
+            torch.save(self.current_chunk_data, chunk_path)
+            return
+        if self.feature_format == "chunk_zip":
+            with zipfile.ZipFile(
+                chunk_path,
+                mode="w",
+                compression=zipfile.ZIP_DEFLATED,
+                compresslevel=self.zip_compress_level,
+            ) as out_zip:
+                for sample_key, feature_pack in self.current_chunk_data.items():
+                    buffer = io.BytesIO()
+                    torch.save(feature_pack, buffer)
+                    out_zip.writestr(f"{sample_key}.pt", buffer.getvalue())
+            return
+        raise ValueError(f"不支持的 feature_format: {self.feature_format}")
 
     def _switch_chunk(self, chunk_id: int):
         if self.current_chunk_id == chunk_id:
             return
         if self.current_chunk_id is not None:
-            torch.save(self.current_chunk_data, self._pt_path(self.current_chunk_id))
+            self._flush_current_chunk()
         self.current_chunk_id = chunk_id
         self.current_chunk_data = {}
 
@@ -60,7 +94,7 @@ class FeatureChunkPtWriter:
 
     def close(self):
         if self.current_chunk_id is not None:
-            torch.save(self.current_chunk_data, self._pt_path(self.current_chunk_id))
+            self._flush_current_chunk()
             self.current_chunk_id = None
             self.current_chunk_data = {}
 
@@ -403,6 +437,8 @@ def collect_data_from_target_model(
     num_draft_layers: int = 8,
     save_hidden_states: bool = False,
     features_per_file: int = 10000,
+    feature_format: str = "chunk_zip",
+    zip_compress_level: int = 6,
     sync_mode: str = "file",
     dist_backend: str = "gloo",
     dist_timeout_seconds: int = 7200,
@@ -425,6 +461,8 @@ def collect_data_from_target_model(
         num_draft_layers: 草稿模型层数（用于确定需要提取的目标层）
         save_hidden_states: 是否保存目标模型隐藏状态（离线训练）
         features_per_file: 每个特征文件保存的样本数
+        feature_format: 特征存储格式（chunk_zip / chunk_pt）
+        zip_compress_level: 当 feature_format=chunk_zip 时的压缩等级（0-9）
     """
     use_process_group = sync_mode == "barrier"
     is_distributed, rank, world_size, local_rank, pg_initialized = init_distributed(
@@ -517,7 +555,17 @@ def collect_data_from_target_model(
     features_dir = output_dir / f"{dataset_name}_{num_samples}_features"
     if save_hidden_states:
         features_dir.mkdir(parents=True, exist_ok=True)
-    feature_writer = FeatureChunkPtWriter(features_dir, rank, features_per_file) if save_hidden_states else None
+    feature_writer = (
+        FeatureChunkWriter(
+            features_dir=features_dir,
+            rank=rank,
+            features_per_file=features_per_file,
+            feature_format=feature_format,
+            zip_compress_level=zip_compress_level,
+        )
+        if save_hidden_states
+        else None
+    )
     
     # 清空或创建分片响应文件
     with open(shard_responses_file, "w", encoding="utf-8") as f:
@@ -713,17 +761,40 @@ def collect_data_from_target_model(
         if save_hidden_states:
             total_chunks = (total_size + features_per_file - 1) // features_per_file
             for chunk_id in range(total_chunks):
-                merged_chunk = features_dir / f"chunk_{chunk_id:05d}.pt"
-                merged_data = {}
-                for shard_rank in range(world_size):
-                    shard_chunk = features_dir / f"chunk_{chunk_id:05d}.rank{shard_rank}.pt"
-                    if not shard_chunk.exists():
-                        continue
-                    shard_data = torch.load(shard_chunk, map_location="cpu", weights_only=False)
-                    merged_data.update(shard_data)
-                    shard_chunk.unlink(missing_ok=True)
-                if merged_data:
-                    torch.save(merged_data, merged_chunk)
+                if feature_format == "chunk_pt":
+                    merged_chunk = features_dir / f"chunk_{chunk_id:05d}.pt"
+                    merged_data = {}
+                    for shard_rank in range(world_size):
+                        shard_chunk = features_dir / f"chunk_{chunk_id:05d}.rank{shard_rank}.pt"
+                        if not shard_chunk.exists():
+                            continue
+                        shard_data = torch.load(shard_chunk, map_location="cpu", weights_only=False)
+                        merged_data.update(shard_data)
+                        shard_chunk.unlink(missing_ok=True)
+                    if merged_data:
+                        torch.save(merged_data, merged_chunk)
+                elif feature_format == "chunk_zip":
+                    merged_chunk = features_dir / f"chunk_{chunk_id:05d}.zip"
+                    wrote_any = False
+                    with zipfile.ZipFile(
+                        merged_chunk,
+                        mode="w",
+                        compression=zipfile.ZIP_DEFLATED,
+                        compresslevel=max(0, min(int(zip_compress_level), 9)),
+                    ) as out_zip:
+                        for shard_rank in range(world_size):
+                            shard_chunk = features_dir / f"chunk_{chunk_id:05d}.rank{shard_rank}.zip"
+                            if not shard_chunk.exists():
+                                continue
+                            with zipfile.ZipFile(shard_chunk, mode="r") as in_zip:
+                                for member_name in in_zip.namelist():
+                                    out_zip.writestr(member_name, in_zip.read(member_name))
+                                    wrote_any = True
+                            shard_chunk.unlink(missing_ok=True)
+                    if not wrote_any:
+                        merged_chunk.unlink(missing_ok=True)
+                else:
+                    raise ValueError(f"不支持的 feature_format: {feature_format}")
             print(f"   - 特征目录: {features_dir}")
     
     # 保存训练配置信息
@@ -755,8 +826,9 @@ def collect_data_from_target_model(
             "token_hidden_alignment": "for token t_i, target_hidden[i] is the hidden used to predict t_i",
             "save_hidden_states": save_hidden_states,
             "features_dir": str(features_dir) if save_hidden_states else None,
-            "feature_format": "chunk_pt" if save_hidden_states else None,
+            "feature_format": feature_format if save_hidden_states else None,
             "features_per_file": features_per_file if save_hidden_states else None,
+            "zip_compress_level": zip_compress_level if (save_hidden_states and feature_format == "chunk_zip") else None,
             "world_size": world_size,
         }
         with open(config_file, "w", encoding="utf-8") as f:
@@ -802,6 +874,10 @@ def main():
                        help="保存目标模型隐藏状态用于离线训练")
     parser.add_argument("--features_per_file", type=int, default=1000,
                        help="每个特征文件保存的样本数量")
+    parser.add_argument("--feature_format", type=str, default="chunk_zip", choices=["chunk_zip", "chunk_pt"],
+                       help="特征存储格式：chunk_zip(压缩，默认) / chunk_pt")
+    parser.add_argument("--zip_compress_level", type=int, default=6,
+                       help="chunk_zip 压缩等级，0-9，越大压缩率越高但更慢")
     parser.add_argument("--sync_mode", type=str, default="file", choices=["file", "barrier"],
                        help="多卡同步方式：file(默认，文件标记同步) / barrier(进程组barrier)")
     parser.add_argument("--dist_backend", type=str, default="gloo", choices=["gloo", "nccl"],
@@ -828,6 +904,8 @@ def main():
         num_draft_layers=args.num_draft_layers,
         save_hidden_states=args.save_hidden_states,
         features_per_file=args.features_per_file,
+        feature_format=args.feature_format,
+        zip_compress_level=args.zip_compress_level,
         sync_mode=args.sync_mode,
         dist_backend=args.dist_backend,
         dist_timeout_seconds=args.dist_timeout_seconds,

@@ -103,7 +103,7 @@ def multi_turn_dialogue(
                 temperature=temperature,
             )
         else:
-            output_ids = draft_model.naive_generate(
+            output_ids = draft_model.spec_generate(
                 target=target_model,
                 input_ids=input_ids,
                 max_new_tokens=max_new_tokens,
@@ -274,7 +274,7 @@ def main():
     MODEL_PAIRS = {
         "qwen3-8b": {
             "target": "/share/public/public_models/Qwen3-8B",
-            "draft": "z-lab/Qwen3-8B-DFlash-b16"
+            "draft": "/share/wanghanzhen/SpeculativeDecoding/NIPS26/SpecForge/cache/models/feature"
         },
         "longwriter-llama3.1-8b": {
             "target": "THUDM/LongWriter-llama3.1-8b",

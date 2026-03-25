@@ -192,7 +192,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         **kwargs,
     ) -> CausalLMOutputWithPast:
         hidden_states = noise_embedding
-        target_hidden = self.hidden_norm(self.fc(target_hidden))
+        target_hidden = self.hidden_norm(self.fc(target_hidden)) # turn on when concat on feature
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
         for layer in self.layers:
             hidden_states = layer(
@@ -248,7 +248,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
 
         output_ids[:, :num_input_tokens] = input_ids
         output_ids[:, num_input_tokens:num_input_tokens+1] = sample(output.logits, temperature)
-        target_hidden = extract_context_feature(output.hidden_states, self.default_target_layer_ids)
+        target_hidden = extract_context_feature(output.hidden_states, self.default_target_layer_ids)[:, -1:, :]
 
         # Decode stage
         acceptance_lengths = []
@@ -267,13 +267,13 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
                 target_hidden=target_hidden,
                 noise_embedding=noise_embedding,
                 position_ids=position_ids[:, start-1: start + block_size],
-                past_key_values=past_key_values_draft,
+                past_key_values=None,
                 use_cache=True,
                 is_causal=False,
             )
             draft_logits = target.lm_head(draft_hidden[:, -block_size+1:, :])
             draft_total_time += time.time() - draft_start_time
-            past_key_values_draft.crop(start)
+            # past_key_values_draft.crop(start)
             block_output_ids[:, 1:] = sample(draft_logits)
 
             # Target model verification
@@ -293,7 +293,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
             output_ids[:, start + acceptance_length + 1] = posterior[:, acceptance_length]
             start += acceptance_length + 1
             past_key_values_target.crop(start)
-            target_hidden = extract_context_feature(output.hidden_states, self.default_target_layer_ids)[:, :acceptance_length + 1, :]
+            target_hidden = extract_context_feature(output.hidden_states, self.default_target_layer_ids)[:, acceptance_length:acceptance_length + 1, :]
             acceptance_lengths.append(acceptance_length+1)
             steps += 1
             if stop_token_ids is not None and any(

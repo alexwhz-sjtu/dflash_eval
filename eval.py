@@ -193,7 +193,7 @@ def main():
         },
         "qwen3-8b": {
             "target": "/share/public/public_models/Qwen3-8B",
-            "draft": "/share/wanghanzhen/SpeculativeDecoding/NIPS26/dflash/train/output/dflash_nemotron/final_model/draft_model"
+            "draft": "/share/wanghanzhen/SpeculativeDecoding/NIPS26/dflash/train/output/dflash_nemotron_0/final_model/draft_model"
         },
         "longwriter-llama3.1-8b": {
             "target": "THUDM/LongWriter-llama3.1-8b",
