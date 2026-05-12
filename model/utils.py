@@ -5,12 +5,20 @@ import time
 import torch
 from typing import Optional
 from pathlib import Path
-from datasets import load_dataset, load_from_disk, Features, Sequence, Value
+from datasets import Dataset, load_dataset, load_from_disk, Features, Sequence, Value
 
 
 NEMOTRON_LOCAL_DATA_DIR = Path(
     "/share/wanghanzhen/.cache/huggingface/hub/datasets--nvidia--Nemotron-Post-Training-Dataset-v2/"
     "snapshots/5c89e01dd720ae0f4058445ed49c5fb68a03c76e/data"
+)
+
+SWE_BENCH_LONG_TEST_FILE = Path(
+    "/data/wanghanzhen/datasets/SWE-bench/data/test-00000-of-00001.parquet"
+)
+
+LONGBENCH_V2_FILE = Path(
+    "/data/wanghanzhen/datasets/LongBench_v2/data.json"
 )
 
 DATASET_CACHE_ROOT = Path(
@@ -141,6 +149,33 @@ def _build_and_process_dataset(data_key: str):
         dataset = load_dataset("HuggingFaceH4/mt_bench_prompts", split="train")
         dataset = dataset.map(lambda x: {"turns": x["prompt"]})
 
+    elif data_key == "longbench_v2":
+        if not LONGBENCH_V2_FILE.exists():
+            raise FileNotFoundError(f"LongBench_v2 json file not found: {LONGBENCH_V2_FILE}")
+
+        with LONGBENCH_V2_FILE.open("r", encoding="utf-8") as f:
+            rows = json.load(f)
+        if not isinstance(rows, list):
+            raise ValueError(f"{LONGBENCH_V2_FILE} must contain a JSON list")
+
+        def format_longbench_v2(doc):
+            return {
+                "turns": [f"{doc['context']}\n\nQuestion: {doc['question']}"],
+                "answer": str(doc.get("answer", "")),
+            }
+
+        target_features = Features(
+            {
+                "turns": Sequence(Value("large_string")),
+                "answer": Value("string"),
+            }
+        )
+        dataset = Dataset.from_list(rows).map(
+            format_longbench_v2,
+            remove_columns=list(rows[0].keys()) if rows else None,
+            features=target_features,
+        )
+
     elif data_key == "nemotron":
         if not NEMOTRON_LOCAL_DATA_DIR.exists():
             raise FileNotFoundError(
@@ -203,6 +238,25 @@ def _build_and_process_dataset(data_key: str):
         dataset = load_dataset("princeton-nlp/SWE-bench_Lite", split="test")
         prompt_fmt = "Problem Statement:\n{problem_statement}\nPlease fix the issue described above."
         dataset = dataset.map(lambda x: {"turns": [prompt_fmt.format(**x)]})
+
+    elif data_key == "swe-bench-long":
+        if not SWE_BENCH_LONG_TEST_FILE.exists():
+            raise FileNotFoundError(
+                f"SWE-bench long parquet file not found: {SWE_BENCH_LONG_TEST_FILE}"
+            )
+
+        dataset = load_dataset(
+            "parquet",
+            data_files={"test": str(SWE_BENCH_LONG_TEST_FILE)},
+            split="test",
+        )
+
+        target_features = Features({"turns": Sequence(Value("large_string"))})
+        dataset = dataset.map(
+            lambda x: {"turns": [x["text"]]},
+            remove_columns=dataset.column_names,
+            features=target_features,
+        )
     
     elif data_key == "livecodebench":
         base = "https://huggingface.co/datasets/livecodebench/code_generation_lite/resolve/main/"

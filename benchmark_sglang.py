@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import json
+import re
 import time
 import statistics
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from typing import Optional
+from pathlib import Path
+from typing import Callable, Optional
 
 import requests
 import torch
@@ -19,6 +22,125 @@ from sglang.test.test_utils import (
     find_available_port,
     popen_launch_server,
 )
+
+DATASET_PATH_FILE = Path(__file__).resolve().with_name("dataset_path.json")
+
+INFINITEBENCH_PROMPTS = {
+    "passkey": "There is an important info hidden inside a lot of irrelevant text. Find it and memorize it. I will quiz you about the important information.\n\n{context}\n\n{input}\n\nThe pass key is",
+    "number_string": "There is an important info hidden inside a lot of irrelevant text. Find it. I will quiz you about the important information there.\n\n{context}\n\n{input}\n\nThe sequence of digits is",
+    "kv_retrieval": "Extract the value corresponding to the specified key in the JSON object below.\n\n{context}\n\n{input}",
+    "longbook_sum_eng": "Summarize the book below.\n\n{context}\n\nSummary:",
+    "longbook_choice_eng": "Read the book and answer the question.\n\n{context}\n\nQuestion: {question}\nA. {OPTION_A}\nB. {OPTION_B}\nC. {OPTION_C}\nD. {OPTION_D}\n\nThe letter of the correct answer is",
+    "longbook_qa_eng": "Read the book and answer the question. Be very concise in your answer.\n\n{context}\n\nQuestion: {question}\nAnswer:",
+    "longbook_qa_chn": "阅读以下书籍然后回答问题。\n\n{context}\n\n问题：{question}\n答案：",
+    "longdialogue_qa_eng": "Below is a dialogue script where one random occurrence of a character name is replaced with \"$$MASK$$\", and you should try to guess who that character is.\n\n{context}\n\nThe name that has been replaced with $$MASK$$ is likely",
+    "math_find": "{prefix}\n\n{context}\n\n{input}",
+    "math_calc": "Let us calculate the intermediate values of an expression.\n\nExpression: 1 + 3 + 4\nValues: [1, 4, 8]\n\nExpression: 8 - 3 + 2 - 4\nValues: [8, 5, 7, 3]\n\nExpression: {context}\nValues:",
+    "code_run": "There is a function called {func} in the following Python code.\n\n{context}\n\nPlease compute the exact value of {func_call}. The value of {func_call} is",
+    "code_debug": "Following is a Python code where exactly one of the functions/methods has a deliberate error that makes it crash.\n\n{context}\n\nOptions:\nA. {OPTION_A}\nB. {OPTION_B}\nC. {OPTION_C}\nD. {OPTION_D}\n\nThe correct option is:",
+}
+
+
+def format_longbench_v2_prompt(data: dict) -> str:
+    if "context" not in data:
+        raise ValueError("Missing 'context' field in LongBench_v2 item")
+    if "question" not in data:
+        raise ValueError("Missing 'question' field in LongBench_v2 item")
+    return f"{data['context']}\n\nQuestion: {data['question']}"
+
+
+def resolve_dataset_path(dataset_name: str) -> str:
+    if not DATASET_PATH_FILE.is_file():
+        return dataset_name
+
+    with DATASET_PATH_FILE.open("r", encoding="utf-8") as f:
+        dataset_paths = json.load(f)
+
+    if not isinstance(dataset_paths, dict):
+        raise ValueError(f"{DATASET_PATH_FILE} must contain a JSON object")
+
+    return dataset_paths.get(dataset_name, dataset_name)
+
+
+def infer_infinitebench_task(dataset_name: str, dataset_path: Path) -> str | None:
+    candidates = [dataset_name, dataset_path.stem]
+    for candidate in candidates:
+        if candidate in INFINITEBENCH_PROMPTS:
+            return candidate
+    return None
+
+
+def format_infinitebench_prompt(data: dict, task_name: str) -> str:
+    template = INFINITEBENCH_PROMPTS[task_name]
+    fields = {
+        "context": data["context"],
+        "input": data.get("input", ""),
+        "question": data.get("input", ""),
+    }
+
+    options = data.get("options") or []
+    for option_index, option_name in enumerate(["OPTION_A", "OPTION_B", "OPTION_C", "OPTION_D"]):
+        if option_index < len(options):
+            fields[option_name] = options[option_index]
+
+    if task_name == "math_find":
+        find_result = re.findall(r"The .+ of", data["input"])
+        if not find_result:
+            raise ValueError(f"Cannot infer math_find target from input: {data['input']}")
+        fields["prefix"] = f"What is {find_result[0].lower()[:-3]} in the following list?"
+
+    if task_name == "code_run":
+        find_result = re.findall(r"func_[0-9]+\(-?[0-9]+\)", data["input"])
+        if not find_result:
+            raise ValueError(f"Cannot infer code_run function call from input: {data['input']}")
+        fields["func_call"] = find_result[0]
+        fields["func"] = fields["func_call"].split("(")[0]
+
+    return template.format(**fields)
+
+
+def load_benchmark_dataset(dataset_name: str):
+    original_dataset_name = dataset_name
+    dataset_name = resolve_dataset_path(dataset_name)
+    dataset_path = Path(dataset_name)
+    if dataset_path.is_file() and dataset_path.suffix == ".json":
+        with dataset_path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, list):
+            raise ValueError(f"{dataset_path} must contain a JSON list")
+
+        if original_dataset_name.lower() == "longbench_v2" or dataset_path.parent.name.lower() == "longbench_v2":
+            return [{"turns": [format_longbench_v2_prompt(item)]} for item in data]
+
+        raise ValueError(f"Unsupported JSON dataset: {dataset_path}")
+
+    if dataset_path.is_file() and dataset_path.suffix == ".jsonl":
+        task_name = infer_infinitebench_task(original_dataset_name, dataset_path)
+        instances = []
+        with dataset_path.open("r", encoding="utf-8") as f:
+            for line_number, line in enumerate(f, start=1):
+                line = line.strip()
+                if not line:
+                    continue
+
+                data = json.loads(line)
+                if "input" not in data:
+                    raise ValueError(
+                        f"Missing 'input' field in {dataset_path} at line {line_number}"
+                    )
+                if "context" not in data:
+                    raise ValueError(
+                        f"Missing 'context' field in {dataset_path} at line {line_number}"
+                    )
+                if task_name is not None:
+                    prompt = format_infinitebench_prompt(data, task_name)
+                else:
+                    prompt = f"{data['context']}\nQuestion: {data['input']}"
+                instances.append({"turns": [prompt]})
+        return instances
+
+    return load_and_process_dataset(dataset_name)
+
 
 def _is_blackwell() -> bool:
     if envs.IS_BLACKWELL.get():
@@ -102,6 +224,19 @@ class BenchMetrics:
     output_toks_per_s: float
     spec_accept_length: Optional[float]
     spec_verify_ct_sum: int
+    responses: list[dict]
+
+
+def _write_response_records(response_json: Optional[str], records: list[dict]) -> None:
+    if not response_json:
+        return
+
+    path = Path(response_json)
+    tmp_path = path.with_name(f".{path.name}.tmp")
+    with tmp_path.open("w", encoding="utf-8") as f:
+        json.dump(records, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    tmp_path.replace(path)
 
 
 def _run_bench_requests(
@@ -114,22 +249,35 @@ def _run_bench_requests(
     stop: list[str],
     timeout_s: int,
     expect_dflash: bool,
+    on_response: Optional[Callable[[dict], None]] = None,
 ) -> BenchMetrics:
     # Drop the first batch from metrics to exclude one-time JIT/cuda-graph overhead
     bs = max(int(concurrency), 1)
+    warmup_count = 0
     if len(prompts) > bs:
         warmup_prompts = prompts[:bs]
+        warmup_count = bs
         if batch_requests:
-            _send_generate_batch(
+            warmup_outs = _send_generate_batch(
                 base_url,
                 warmup_prompts,
                 max_new_tokens=max_new_tokens,
                 stop=stop,
                 timeout_s=timeout_s,
             )
+            if on_response is not None:
+                for j, out in enumerate(warmup_outs):
+                    on_response(
+                        {
+                            "index": j,
+                            "warmup": True,
+                            "response": out.get("text", ""),
+                            "meta_info": out.get("meta_info", {}) or {},
+                        }
+                    )
         else:
             with ThreadPoolExecutor(max_workers=int(concurrency)) as pool:
-                futures = [
+                futures = {
                     pool.submit(
                         _send_generate,
                         base_url,
@@ -137,11 +285,20 @@ def _run_bench_requests(
                         max_new_tokens=max_new_tokens,
                         stop=stop,
                         timeout_s=timeout_s,
-                    )
-                    for prompt in warmup_prompts
-                ]
+                    ): i
+                    for i, prompt in enumerate(warmup_prompts)
+                }
                 for fut in as_completed(futures):
-                    fut.result()
+                    out = fut.result()
+                    if on_response is not None:
+                        on_response(
+                            {
+                                "index": futures[fut],
+                                "warmup": True,
+                                "response": out.get("text", ""),
+                                "meta_info": out.get("meta_info", {}) or {},
+                            }
+                        )
 
         prompts = prompts[bs:]
 
@@ -149,6 +306,7 @@ def _run_bench_requests(
     total_tokens = 0
     spec_verify_ct_sum = 0
     spec_accept_lengths: list[float] = []
+    responses: list[dict] = []
 
     if batch_requests:
         bs = max(int(concurrency), 1)
@@ -176,6 +334,15 @@ def _run_bench_requests(
                         spec_accept_lengths.append(float(meta["spec_accept_length"]))
                     except (TypeError, ValueError):
                         pass
+                record = {
+                    "index": warmup_count + start_idx + j,
+                    "warmup": False,
+                    "response": out.get("text", ""),
+                    "meta_info": meta,
+                }
+                responses.append(record)
+                if on_response is not None:
+                    on_response(record)
     else:
         with ThreadPoolExecutor(max_workers=int(concurrency)) as pool:
             futures = {
@@ -191,6 +358,7 @@ def _run_bench_requests(
             }
             for fut in as_completed(futures):
                 out = fut.result()
+                prompt_index = futures[fut]
                 meta = out.get("meta_info", {}) or {}
                 total_tokens += int(meta.get("completion_tokens", 0))
                 spec_verify_ct_sum += int(meta.get("spec_verify_ct", 0))
@@ -199,6 +367,15 @@ def _run_bench_requests(
                         spec_accept_lengths.append(float(meta["spec_accept_length"]))
                     except (TypeError, ValueError):
                         pass
+                record = {
+                    "index": warmup_count + prompt_index,
+                    "warmup": False,
+                    "response": out.get("text", ""),
+                    "meta_info": meta,
+                }
+                responses.append(record)
+                if on_response is not None:
+                    on_response(record)
 
     latency = time.perf_counter() - start
     toks_per_s = total_tokens / max(latency, 1e-6)
@@ -219,6 +396,7 @@ def _run_bench_requests(
         output_toks_per_s=float(toks_per_s),
         spec_accept_length=spec_accept_length,
         spec_verify_ct_sum=int(spec_verify_ct_sum),
+        responses=sorted(responses, key=lambda x: x["index"]),
     )
 
 
@@ -249,6 +427,12 @@ def main() -> None:
         default=None,
         help="Write a markdown report to this file (disabled by default).",
     )
+    parser.add_argument(
+        "--response-json",
+        type=str,
+        default="response.json",
+        help="Write per-question generated responses to this JSON file.",
+    )
     parser.add_argument("--dataset-name", type=str, default="gsm8k")
     parser.add_argument("--target-model", type=str, default="Qwen/Qwen3-8B")
     parser.add_argument("--draft-model", type=str, default="z-lab/Qwen3-8B-DFlash-b16")
@@ -269,6 +453,18 @@ def main() -> None:
     parser.add_argument("--dtype", type=str, default="bfloat16")
     parser.add_argument("--max-running-requests", type=int, default=64)
     parser.add_argument(
+        "--context-length",
+        type=int,
+        default=None,
+        help="Optional SGLang server context length override, e.g. 200000 for 160k-token prompts.",
+    )
+    parser.add_argument(
+        "--max-input-tokens",
+        type=int,
+        default=None,
+        help="Skip prompts whose tokenized input length exceeds this value. Defaults to --context-length when set.",
+    )
+    parser.add_argument(
         "--tp-size",
         type=int,
         default=1,
@@ -277,13 +473,13 @@ def main() -> None:
     parser.add_argument(
         "--concurrencies",
         type=str,
-        default="1,2,4,8,16,32",
+        default="1",
         help="Comma-separated list of client concurrency levels.",
     )
     parser.add_argument(
         "--questions-per-concurrency-base",
         type=int,
-        default=128,
+        default=10,
         help="num_questions = base * concurrency (default matches the sweep plan).",
     )
     parser.add_argument(
@@ -295,13 +491,19 @@ def main() -> None:
     parser.add_argument(
         "--attention-backends",
         type=str,
-        default="flashinfer,fa3,fa4",
+        default="flashinfer",
         help="Comma-separated list. Will auto-skip fa3 unless SM90 (Hopper), and fa4 unless SM100+ (Blackwell).",
     )
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for this sweep.")
+    if args.batch_requests and args.response_json:
+        print(
+            "Warning: --batch-requests returns one server-side batch at a time, "
+            "so response JSON updates only after each batch completes. "
+            "Omit --batch-requests for per-question completion writes."
+        )
 
     concurrencies = [int(x) for x in args.concurrencies.split(",") if x.strip()]
     concurrencies = [c for c in concurrencies if c >= 1]
@@ -324,17 +526,20 @@ def main() -> None:
         attention_backends = [b for b in attention_backends if b != "fa4"]
     attention_backends = attention_backends or ["flashinfer"]
 
-    # --- Load Data using the new function ---
     print(f"Loading dataset: {args.dataset_name}...")
-    dataset = load_and_process_dataset(args.dataset_name)
+    dataset = load_benchmark_dataset(args.dataset_name)
     required_questions = max_questions + max_concurrency
     
     if len(dataset) < required_questions:
          print(f"Warning: Dataset has {len(dataset)} items, but need up to {required_questions}. Reusing items.")
 
     tokenizer = AutoTokenizer.from_pretrained(args.target_model)
+    max_input_tokens = args.max_input_tokens
+    if max_input_tokens is None and args.context_length is not None:
+        max_input_tokens = int(args.context_length)
 
     prompts: list[str] = []
+    skipped_too_long = 0
     # Build prompts list
     for i in range(max(len(dataset), required_questions)):
         item = dataset[i % len(dataset)]
@@ -347,15 +552,46 @@ def main() -> None:
             add_generation_prompt=True,
             enable_thinking=False,
         )
+        if max_input_tokens is not None:
+            prompt_len = len(tokenizer.encode(prompt_text, add_special_tokens=False))
+            if prompt_len > max_input_tokens:
+                skipped_too_long += 1
+                continue
         prompts.append(prompt_text)
         if len(prompts) >= required_questions:
             break
+    if len(prompts) < required_questions:
+        raise RuntimeError(
+            f"Only built {len(prompts)} prompts after filtering, but need {required_questions}. "
+            f"Skipped {skipped_too_long} prompts longer than {max_input_tokens} tokens."
+        )
+    if skipped_too_long:
+        print(
+            f"Skipped {skipped_too_long} prompts longer than {max_input_tokens} tokens."
+        )
 
     # Results indexed by (backend, concurrency) for baseline + dflash.
     # Removed TP dimension from keys since we aren't sweeping it.
     baseline_toks: dict[tuple[str, int], Optional[float]] = {}
     dflash_toks: dict[tuple[str, int], Optional[float]] = {}
     dflash_accept_len: dict[tuple[str, int], Optional[float]] = {}
+    response_records: list[dict] = []
+    _write_response_records(args.response_json, response_records)
+
+    def persist_response(runner: str, backend: str, conc: int, record: dict) -> None:
+        response_records.append(
+            {
+                "dataset": args.dataset_name,
+                "runner": runner,
+                "backend": backend,
+                "concurrency": conc,
+                "question_index": record["index"],
+                "warmup": bool(record.get("warmup", False)),
+                "response": record["response"],
+                "meta_info": record["meta_info"],
+            }
+        )
+        _write_response_records(args.response_json, response_records)
     
     tp = args.tp_size  # Fixed TP size
 
@@ -380,6 +616,8 @@ def main() -> None:
         )
         if args.disable_radix_cache:
             common_server_args.append("--disable-radix-cache")
+        if args.context_length is not None:
+            common_server_args.extend(["--context-length", str(args.context_length)])
 
         if not args.skip_baseline:
             print(f"\n=== backend={backend} tp={tp} (baseline) ===")
@@ -416,6 +654,9 @@ def main() -> None:
                         stop=[],
                         timeout_s=int(args.timeout_s),
                         expect_dflash=False,
+                        on_response=lambda record, b=backend, c=conc: persist_response(
+                            "baseline", b, c, record
+                        ),
                     )
                     baseline_toks[(backend, conc)] = metrics.output_toks_per_s
                     print(
@@ -459,6 +700,7 @@ def main() -> None:
                 print(
                     f"[warmup] run 1 warmup batch (size={conc}) after /flush_cache; excluded from metrics."
                 )
+
                 metrics = _run_bench_requests(
                     dflash_url,
                     prompts=prompts[: n + conc],
@@ -468,6 +710,9 @@ def main() -> None:
                     stop=[],
                     timeout_s=int(args.timeout_s),
                     expect_dflash=True,
+                    on_response=lambda record, b=backend, c=conc: persist_response(
+                        "dflash", b, c, record
+                    ),
                 )
                 dflash_toks[(backend, conc)] = metrics.output_toks_per_s
                 dflash_accept_len[(backend, conc)] = metrics.spec_accept_length
@@ -570,6 +815,10 @@ def main() -> None:
         print(f"\nWrote markdown report to: {args.output_md}")
     else:
         print("\nMarkdown report disabled (pass --output-md to write one).")
+
+    if args.response_json:
+        _write_response_records(args.response_json, response_records)
+        print(f"Wrote per-question responses to: {args.response_json}")
 
 
 if __name__ == "__main__":

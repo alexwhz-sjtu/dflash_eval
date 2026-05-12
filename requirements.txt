@@ -4,3 +4,4 @@ rich
 packaging
 ninja
 wandb
+tqdm
