@@ -273,11 +273,11 @@ def dflash_generate(
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model-name-or-path", type=str, default="/data/wanghanzhen/models/Qwen/Qwen3-8B")
-    parser.add_argument("--draft-name-or-path", type=str, default="/data/wanghanzhen/Projects/MTP/NIPS26/FlashMTP/cache/models/dflash_sample_40000_think_off_qwen3_8b_maxlen4096/epoch_6_step_29844")
+    parser.add_argument("--model-name-or-path", type=str, default="/share/public/public_models/Qwen3-8B")
+    parser.add_argument("--draft-name-or-path", type=str, default="z-lab/Qwen3-8B-DFlash-b16")
     parser.add_argument("--block-size", type=int, default=None)
     parser.add_argument("--dataset", type=str, required=True)
-    parser.add_argument("--max-samples", type=int, default=10)
+    parser.add_argument("--max-samples", type=int, default=50)
     parser.add_argument("--max-new-tokens", type=int, default=4096)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--think", action="store_true")
