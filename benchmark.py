@@ -172,17 +172,35 @@ def dflash_generate(
     block_size: int,
     stop_token_ids: list[int],
     temperature: float = 0.0,
+    batch_size: int = 1,
 ) -> SimpleNamespace:
+    """Decode with optional batch replication: same prompt on dim 0 ``batch_size`` times."""
+    if batch_size < 1:
+        raise ValueError("batch_size must be >= 1")
+    if input_ids.dim() != 2:
+        raise ValueError("input_ids must be [batch, seq_len]")
+    if input_ids.shape[0] == 1 and batch_size > 1:
+        input_ids = input_ids.expand(batch_size, -1).contiguous()
+    elif input_ids.shape[0] != batch_size:
+        raise ValueError(
+            f"input_ids batch {input_ids.shape[0]} does not match batch_size={batch_size}"
+        )
+    if batch_size > 1 and temperature >= 1e-5:
+        raise ValueError(
+            "batch_size>1 requires temperature≈0 so replicated streams stay synchronized."
+        )
+
+    bsz = int(input_ids.shape[0])
     num_input_tokens = input_ids.shape[1]
     max_length = num_input_tokens + max_new_tokens
 
     output_ids = torch.full(
-        (1, max_length + block_size),
+        (bsz, max_length + block_size),
         mask_token_id,
         dtype=torch.long,
         device=model.device,
     )
-    position_ids = torch.arange(output_ids.shape[1], device=model.device).unsqueeze(0)
+    position_ids = torch.arange(output_ids.shape[1], device=model.device).unsqueeze(0).expand(bsz, -1)
     past_key_values_target = DynamicCache()
     past_key_values_draft = DynamicCache()
 
@@ -202,11 +220,12 @@ def dflash_generate(
     if block_size > 1:
         target_hidden = extract_context_feature(output.hidden_states, model.target_layer_ids)
 
-    time_to_first_token = cuda_time() - prefill_start
+    prefill_wall = cuda_time() - prefill_start
+    time_to_first_token = prefill_wall / bsz
 
     # Decode stage
     decode_start = cuda_time()
-    start = input_ids.shape[1]
+    start = num_input_tokens
     acceptance_lengths = []
 
     while start < max_length:
@@ -234,7 +253,13 @@ def dflash_generate(
         )
 
         posterior = sample(output.logits, temperature)
-        acceptance_length = (block_output_ids[:, 1:] == posterior[:, :-1]).cumprod(dim=1).sum(dim=1)[0].item()
+        acc_per_row = (block_output_ids[:, 1:] == posterior[:, :-1]).cumprod(dim=1).sum(dim=1)
+        if not bool(torch.all(acc_per_row == acc_per_row[0])):
+            raise RuntimeError(
+                "Per-row acceptance lengths differ under batched decode. "
+                "Use batch_size=1 with sampling, or temperature=0 with identical prompts."
+            )
+        acceptance_length = int(acc_per_row[0].item())
         output_ids[:, start : start + acceptance_length + 1] = block_output_ids[:, : acceptance_length + 1]
         output_ids[:, start + acceptance_length + 1] = posterior[:, acceptance_length]
 
@@ -252,21 +277,25 @@ def dflash_generate(
     output_ids = output_ids[:, :max_length]
     output_ids = output_ids[:, output_ids[0] != mask_token_id]
     if stop_token_ids is not None:
-        stop_token_ids = torch.tensor(stop_token_ids, device=output_ids.device)
-        stop_token_indices = torch.isin(output_ids[0][num_input_tokens:], stop_token_ids).nonzero(as_tuple=True)[0]
+        stop_tensor = torch.tensor(stop_token_ids, device=output_ids.device)
+        stop_token_indices = torch.isin(output_ids[0][num_input_tokens:], stop_tensor).nonzero(as_tuple=True)[0]
         if stop_token_indices.numel() > 0:
             output_ids = output_ids[:, : num_input_tokens + stop_token_indices[0] + 1]
 
     num_output_tokens = output_ids.shape[1] - num_input_tokens
     total_decode_time = cuda_time() - decode_start
-    time_per_output_token = total_decode_time / num_output_tokens
+    # Wall time amortized over all generated tokens across the batch (comparable across batch_size).
+    time_per_output_token = total_decode_time / (bsz * max(num_output_tokens, 1))
+    throughput_tokens_per_sec = (bsz * num_output_tokens) / max(total_decode_time, 1e-9)
 
     return SimpleNamespace(
         output_ids=output_ids,
         num_input_tokens=num_input_tokens,
         num_output_tokens=num_output_tokens,
+        batch_size=bsz,
         time_to_first_token=time_to_first_token,
         time_per_output_token=time_per_output_token,
+        throughput_tokens_per_sec=float(throughput_tokens_per_sec),
         acceptance_lengths=acceptance_lengths,
     )
 
@@ -280,6 +309,14 @@ def main() -> None:
     parser.add_argument("--max-samples", type=int, default=50)
     parser.add_argument("--max-new-tokens", type=int, default=4096)
     parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=1,
+        help="Replicate each prompt on batch dim (same input_ids stacked). "
+        "Requires temperature≈0 so streams stay in sync. "
+        "time_per_output_token = decode_wall / (batch_size * num_new_tokens).",
+    )
     parser.add_argument("--think", action="store_true")
     args = parser.parse_args()
 
@@ -317,6 +354,7 @@ def main() -> None:
     ).to(device).eval()
 
     print(f"flash attention installed: {installed_flash_attn}")
+    print(f"batch_size (replicated prompts per forward): {args.batch_size}")
 
     block_size = args.block_size if args.block_size is not None else draft_model.block_size
 
@@ -342,16 +380,17 @@ def main() -> None:
             )
 
             response = {}
-            for bs in [1, block_size]:
-                response[bs] = dflash_generate(
+            for spec_block in [1, block_size]:
+                response[spec_block] = dflash_generate(
                     model=draft_model,
                     target=target,
                     input_ids=input_ids,
                     mask_token_id=mask_token_id,
                     max_new_tokens=args.max_new_tokens,
-                    block_size=bs,
+                    block_size=spec_block,
                     stop_token_ids=stop_token_ids,
                     temperature=args.temperature,
+                    batch_size=args.batch_size,
                 )
             
             spec_response = response[block_size]
@@ -364,9 +403,11 @@ def main() -> None:
             avg_acceptance_length = np.mean(spec_response.acceptance_lengths)
             print(f"\n[Sample {idx} | Turn {turn_index}] Response:\n{output_text}")
             print(
-                f"[Sample {idx} | Turn {turn_index}] Decode timing: "
-                f"baseline={response[1].time_per_output_token:.6f}s/token, "
-                f"flashmtp_total={spec_response.time_per_output_token:.6f}s/token"
+                f"[Sample {idx} | Turn {turn_index}] Decode timing (amortized s/token, batch={args.batch_size}): "
+                f"baseline={response[1].time_per_output_token:.6f}, "
+                f"flashmtp={spec_response.time_per_output_token:.6f} | "
+                f"tok/s (batch total): baseline={response[1].throughput_tokens_per_sec:.2f}, "
+                f"flashmtp={spec_response.throughput_tokens_per_sec:.2f}"
             )
             print(
                 f"[Sample {idx} | Turn {turn_index}] Acceptance lengths (position:length): "
@@ -385,17 +426,13 @@ def main() -> None:
 
     t1 = np.mean([r[1].time_per_output_token for r in responses])
     tb = np.mean([r[block_size].time_per_output_token for r in responses])
-    print(f"Decoding speedup: {t1 / tb:.2f}")
+    print(f"Decoding speedup (amortized s/token, batch_size={args.batch_size}): {t1 / tb:.2f}")
 
     acceptance_lengths = list(chain(*[r[block_size].acceptance_lengths for r in responses]))
     histogram = [acceptance_lengths.count(b) / len(acceptance_lengths) for b in range(block_size + 1)]
     print(f"Acceptance length histogram: {[f'{x * 100:.1f}%' for x in histogram]}")
-    
-    tau = 0
-    for index, item in enumerate(histogram):  # 使用 enumerate 获取索引和值
-        num = float(item.replace('%', ''))
-        tau += index * num / 100  # 注意：这里除以100是将百分比转为小数
 
+    tau = float(np.mean(acceptance_lengths))
     print(f"Average Acceptance length: {tau:.2f}")
 
     total_elapsed_time = cuda_time() - benchmark_start
