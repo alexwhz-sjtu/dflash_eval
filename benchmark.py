@@ -432,7 +432,10 @@ def main() -> None:
     histogram = [acceptance_lengths.count(b) / len(acceptance_lengths) for b in range(block_size + 1)]
     print(f"Acceptance length histogram: {[f'{x * 100:.1f}%' for x in histogram]}")
 
-    tau = float(np.mean(acceptance_lengths))
+    
+    tau = 0
+    for index, num in enumerate(histogram): 
+        tau += index * num / 100 
     print(f"Average Acceptance length: {tau:.2f}")
 
     total_elapsed_time = cuda_time() - benchmark_start
