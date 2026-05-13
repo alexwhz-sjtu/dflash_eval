@@ -387,12 +387,16 @@ def main() -> None:
     tb = np.mean([r[block_size].time_per_output_token for r in responses])
     print(f"Decoding speedup: {t1 / tb:.2f}")
 
-    tau = np.mean([np.mean(r[block_size].acceptance_lengths) for r in responses])
-    print(f"Average Acceptance length: {tau:.2f}")
-
     acceptance_lengths = list(chain(*[r[block_size].acceptance_lengths for r in responses]))
     histogram = [acceptance_lengths.count(b) / len(acceptance_lengths) for b in range(block_size + 1)]
     print(f"Acceptance length histogram: {[f'{x * 100:.1f}%' for x in histogram]}")
+    
+    tau = 0
+    for index, item in enumerate(histogram):  # 使用 enumerate 获取索引和值
+        num = float(item.replace('%', ''))
+        tau += index * num / 100  # 注意：这里除以100是将百分比转为小数
+
+    print(f"Average Acceptance length: {tau:.2f}")
 
     total_elapsed_time = cuda_time() - benchmark_start
     print(f"Total elapsed time: {total_elapsed_time:.2f}s")
