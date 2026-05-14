@@ -465,7 +465,7 @@ def main() -> None:
     
     tau = 0
     for index, num in enumerate(histogram): 
-        tau += index * num / 100 
+        tau += index * num 
     print(f"Average Acceptance length: {tau:.2f}")
 
     total_elapsed_time = cuda_time() - benchmark_start
