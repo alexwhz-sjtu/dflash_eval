@@ -1,0 +1,2 @@
+flash attention installed: True
+batch_size (replicated prompts per forward): 1
